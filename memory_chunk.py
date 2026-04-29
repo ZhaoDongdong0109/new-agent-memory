@@ -5,6 +5,7 @@
 - 每个记忆是一个碎片（chunk），携带多维标签
 - 标签是检索的入口，类似C语言头文件
 - 内容与标签分离，支持高效的检索
+- 支持记忆类型区分（影响权重策略）
 """
 
 from dataclasses import dataclass, field
@@ -12,6 +13,9 @@ from typing import Set, Dict, Optional, Any
 from enum import Enum
 import time
 import uuid
+
+# 导入记忆类型枚举
+from core.weight_system import MemoryType
 
 
 class MemoryLayer(Enum):
@@ -29,16 +33,20 @@ class MemoryChunk:
     - content 是实际记忆内容
     - tags 是元信息（头文件），用于检索
     - layer 标记当前所在层级
+    - memory_type 影响权重衰减策略
     """
     
     # 唯一标识
     id: str = field(default_factory=lambda: f"mem_{uuid.uuid4().hex[:12]}")
     
-    # 记忆内容（可以是原始文本、事件描述、或指向更大碎片的引用）
+    # 记忆内容
     content: str = ""
     
-    # 记忆类型（影响权重策略）
-    memory_type: str = "general"  # general / emotion / fact / procedure
+    # 摘要（用于索引和快速检索）
+    summary: str = ""
+    
+    # 记忆类型（影响衰减节奏）
+    memory_type: MemoryType = MemoryType.INTERACTION
     
     # 多维标签（头文件）
     tags: Dict[str, Any] = field(default_factory=dict)
@@ -54,7 +62,7 @@ class MemoryChunk:
     
     # 人物维度
     persons: Set[str] = field(default_factory=set)  # 涉及的人物
-    person_count: int = 1                      # 涉及人数
+    person_count: int = 1
     
     # 主题/语义维度
     topics: Set[str] = field(default_factory=set)  # 主题标签
@@ -63,12 +71,10 @@ class MemoryChunk:
     # 情绪维度
     emotion_valence: float = 0.0   # 情绪效价 -1.0(负面) ~ +1.0(正面)
     emotion_intensity: float = 0.0 # 情绪强度 0.0 ~ 1.0
+    emotion_tags: Set[str] = field(default_factory=set)  # 情绪标签列表
     
-    # 重要性（主观）
-    importance: float = 0.5        # 0.0 ~ 1.0
-    
-    # 连接价值（能触发多少其他记忆）
-    connection_value: float = 0.5  # 0.0 ~ 1.0
+    # 连接价值
+    connection_value: float = 0.5  # 能触发多少其他记忆
     
     # 层级
     layer: MemoryLayer = MemoryLayer.CORE
@@ -89,7 +95,11 @@ class MemoryChunk:
     review_status: str = "pending"  # pending / approved / questionable / rejected
     review_note: Optional[str] = None
     
-    # 元数据（扩展字段，存储额外信息）
+    # 重建相关
+    reconstruction_count: int = 0   # 被重建过的次数
+    parent_id: Optional[str] = None  # 如果是从旧版本重建的，记录原记忆ID
+    
+    # 元数据（扩展字段）
     metadata: Dict[str, Any] = field(default_factory=dict)
     
     def access(self):
@@ -101,6 +111,11 @@ class MemoryChunk:
     def successful_recall(self):
         """记录一次成功唤醒"""
         self.successful_recall_count += 1
+    
+    def record_reconstruction(self, parent_id: str):
+        """记录一次重建"""
+        self.reconstruction_count += 1
+        self.parent_id = parent_id
     
     def get_tag_signature(self) -> str:
         """
@@ -129,12 +144,15 @@ class MemoryChunk:
         for t in sorted(self.topics):
             parts.append(f"TOP:{t}")
         
+        # 情绪标签
+        for e in sorted(self.emotion_tags):
+            parts.append(f"EM:{e}")
+        
         return " | ".join(parts)
     
     def matches_query(self, query_tags: Dict[str, Any]) -> bool:
         """
         检查当前碎片是否匹配查询标签
-        类似 #include 时的编译检查
         """
         # 时间匹配
         if "time_absolute" in query_tags:
@@ -172,11 +190,6 @@ class MemoryChunk:
             if self.emotion_valence > query_tags["emotion_valence_max"]:
                 return False
         
-        # 重要性匹配
-        if "importance_min" in query_tags:
-            if self.importance < query_tags["importance_min"]:
-                return False
-        
         return True
     
     def to_dict(self) -> Dict:
@@ -184,7 +197,8 @@ class MemoryChunk:
         return {
             "id": self.id,
             "content": self.content,
-            "memory_type": self.memory_type,
+            "summary": self.summary,
+            "memory_type": self.memory_type.value if isinstance(self.memory_type, MemoryType) else self.memory_type,
             "tags": self.tags,
             "time_absolute": self.time_absolute,
             "time_relative": self.time_relative,
@@ -197,7 +211,7 @@ class MemoryChunk:
             "keywords": list(self.keywords),
             "emotion_valence": self.emotion_valence,
             "emotion_intensity": self.emotion_intensity,
-            "importance": self.importance,
+            "emotion_tags": list(self.emotion_tags),
             "connection_value": self.connection_value,
             "layer": self.layer.value,
             "created_at": self.created_at,
@@ -208,6 +222,8 @@ class MemoryChunk:
             "associations": self.associations,
             "review_status": self.review_status,
             "review_note": self.review_note,
+            "reconstruction_count": self.reconstruction_count,
+            "parent_id": self.parent_id,
             "metadata": self.metadata,
         }
     
@@ -218,9 +234,16 @@ class MemoryChunk:
         data["persons"] = set(data.get("persons", []))
         data["topics"] = set(data.get("topics", []))
         data["keywords"] = set(data.get("keywords", []))
+        data["emotion_tags"] = set(data.get("emotion_tags", []))
         data["layer"] = MemoryLayer(data.get("layer", "core"))
+        
+        memory_type_val = data.get("memory_type", "interaction")
+        if isinstance(memory_type_val, str):
+            data["memory_type"] = MemoryType(memory_type_val)
+        
         return cls(**data)
     
     def __repr__(self) -> str:
         content_preview = self.content[:30] + "..." if len(self.content) > 30 else self.content
-        return f"<MemoryChunk {self.id} [{self.layer.value}] '{content_preview}'>"
+        type_str = self.memory_type.value if isinstance(self.memory_type, MemoryType) else self.memory_type
+        return f"<MemoryChunk {self.id} [{type_str}] '{content_preview}'>"
