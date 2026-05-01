@@ -182,10 +182,11 @@ class AdaptiveWeightSystem:
         delta = self.global_interaction_count - memory.last_strengthened_at_interaction
         recency_decay = self._calculate_recency_decay(memory)
         
-        # 情绪修正系数（从上次强化时的情绪采样）
+        # 情绪修正系数（从上次强化时的情绪标签再激活采样）
         emotion_result = self.emotion_engine.infer_emotion(
             "",  # 不需要文本，用上次保存的情绪标签
             context={"topic_repeat_count": 0},
+            user_override=memory.last_emotion if memory.last_emotion != "平静" else None,
         )
         emotion_modifier = emotion_result.coefficient
         

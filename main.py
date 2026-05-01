@@ -11,6 +11,8 @@ from memory_chunk import MemoryChunk, MemoryLayer
 from memory_layer_core import MemoryLayerCore
 from forgotten_layer import ForgottenLayer
 from retrieval import MemoryRetrieval, QueryContext, ReconstructionResult, ReviewResult
+from core.weight_system import MemoryType
+from core.persona_layer import PersonaLayer, BehaviorType
 
 
 class HumanLikeMemorySystem:
@@ -68,8 +70,11 @@ class HumanLikeMemorySystem:
         self.retrieval = MemoryRetrieval(
             core_layer=self.core,
             forgotten_layer=self.forgotten,
-            review_confidence_threshold=retrievance_confidence_threshold,
+            review_confidence_threshold=retrieval_confidence_threshold,
         )
+        
+        # 人格适应层
+        self.persona = PersonaLayer()
         
         # 定时任务
         self.last_maintenance = time.time()
@@ -80,7 +85,7 @@ class HumanLikeMemorySystem:
     def add_memory(
         self,
         content: str,
-        memory_type: str = "general",
+        memory_type: MemoryType = MemoryType.INTERACTION,
         
         # 时间维度
         time_absolute: Optional[str] = None,
@@ -270,6 +275,28 @@ class HumanLikeMemorySystem:
     ):
         """用户反馈"""
         self.retrieval.feedback(query, accepted, corrected_content)
+        
+        # 同步给人格适应层
+        if accepted:
+            self.persona.on_active_recall_continue()
+        else:
+            self.persona.on_active_recall_ignore()
+    
+    def on_active_recall_explicit_positive(self):
+        """用户对主动提及表示惊喜"""
+        return self.persona.on_active_recall_explicit_positive()
+    
+    def on_active_recall_explicit_negative(self):
+        """用户对主动提及表示厌烦"""
+        return self.persona.on_active_recall_explicit_negative()
+    
+    def should_trigger_active_recall(self) -> bool:
+        """是否应该主动提及旧记忆"""
+        return self.persona.should_trigger_active_recall()
+    
+    def get_persona_summary(self) -> Dict[str, Any]:
+        """获取人格适应层摘要"""
+        return self.persona.get_profile_summary()
     
     # ============ 维护 ============
     
@@ -312,18 +339,37 @@ class HumanLikeMemorySystem:
         
         self.core.save(f"{self.data_dir}/core.json")
         self.forgotten.save(f"{self.data_dir}/forgotten.json")
+        
+        # 保存人格适应层
+        import json
+        persona_path = f"{self.data_dir}/persona.json"
+        with open(persona_path, 'w', encoding='utf-8') as f:
+            json.dump(self.persona.export_profile(), f, ensure_ascii=False, indent=2)
     
     def load(self) -> bool:
         """加载数据"""
         import os
+        import json
         
         core_path = f"{self.data_dir}/core.json"
         forgotten_path = f"{self.data_dir}/forgotten.json"
+        persona_path = f"{self.data_dir}/persona.json"
         
         core_loaded = self.core.load(core_path) if os.path.exists(core_path) else False
         forgotten_loaded = self.forgotten.load(forgotten_path) if os.path.exists(forgotten_path) else False
         
-        return core_loaded or forgotten_loaded
+        # 加载人格适应层
+        persona_loaded = False
+        if os.path.exists(persona_path):
+            try:
+                with open(persona_path, 'r', encoding='utf-8') as f:
+                    persona_data = json.load(f)
+                self.persona = PersonaLayer.from_profile(persona_data)
+                persona_loaded = True
+            except Exception:
+                pass
+        
+        return core_loaded or forgotten_loaded or persona_loaded
     
     # ============ 统计 ============
     
@@ -341,6 +387,7 @@ class HumanLikeMemorySystem:
                 "types": f_stats.chunk_types,
             },
             "retrieval_stats": self.retrieval.get_stats(),
+            "persona_summary": self.persona.get_profile_summary(),
         }
     
     def get_recent_memories(self, limit: int = 10) -> List[Dict]:

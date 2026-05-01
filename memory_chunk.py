@@ -76,6 +76,9 @@ class MemoryChunk:
     # 连接价值
     connection_value: float = 0.5  # 能触发多少其他记忆
     
+    # 重要性（用户对这件事的长期重视程度，0~1）
+    importance: float = 0.5
+    
     # 层级
     layer: MemoryLayer = MemoryLayer.CORE
     
@@ -213,6 +216,7 @@ class MemoryChunk:
             "emotion_intensity": self.emotion_intensity,
             "emotion_tags": list(self.emotion_tags),
             "connection_value": self.connection_value,
+            "importance": self.importance,
             "layer": self.layer.value,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
