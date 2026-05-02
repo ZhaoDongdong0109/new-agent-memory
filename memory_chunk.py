@@ -156,18 +156,28 @@ class MemoryChunk:
     def matches_query(self, query_tags: Dict[str, Any]) -> bool:
         """
         检查当前碎片是否匹配查询标签
+        
+        时间字段（time_absolute, time_relative, time_context）使用宽松匹配：
+        - 如果查询指定了 time_relative，同时也匹配 time_context
+        - 如果查询指定了 time_context，同时也匹配 time_relative
+        这样可以处理"昨天"这类语义重叠的时间词
         """
         # 时间匹配
         if "time_absolute" in query_tags:
             if self.time_absolute != query_tags["time_absolute"]:
                 return False
         
+        # 相对时间和上下文使用宽松匹配（两者可以互通）
         if "time_relative" in query_tags:
-            if self.time_relative != query_tags["time_relative"]:
+            query_val = query_tags["time_relative"]
+            # 同时检查 time_relative 和 time_context
+            if self.time_relative != query_val and self.time_context != query_val:
                 return False
         
         if "time_context" in query_tags:
-            if self.time_context != query_tags["time_context"]:
+            query_val = query_tags["time_context"]
+            # 同时检查 time_context 和 time_relative
+            if self.time_context != query_val and self.time_relative != query_val:
                 return False
         
         # 地点匹配
