@@ -487,9 +487,20 @@ class HumanMemorySystem:
                 self.association_graph[existing_id].add(memory_id)
     
     def _semantic_similarity(self, text1: str, text2: str) -> float:
-        """简化语义相似度计算"""
-        words1 = set(text1.lower().split())
-        words2 = set(text2.lower().split())
+        """优化版语义相似度计算"""
+        if not text1 or not text2:
+            return 0.0
+        
+        # 预处理文本
+        text1 = text1.lower()
+        text2 = text2.lower()
+        
+        # 子字符串匹配（更宽松）
+        if text1 in text2 or text2 in text1:
+            return 0.9
+        
+        words1 = set(text1.split())
+        words2 = set(text2.split())
         
         if not words1 or not words2:
             return 0.0
@@ -497,7 +508,31 @@ class HumanMemorySystem:
         intersection = len(words1 & words2)
         union = len(words1 | words2)
         
-        return intersection / union if union > 0 else 0.0
+        # 基础Jaccard
+        jaccard = intersection / union if union > 0 else 0.0
+        
+        # 加上部分匹配的奖励
+        partial_match = 0
+        for word1 in words1:
+            for word2 in words2:
+                if len(word1) > 2 and len(word2) > 2:
+                    if word1 in word2 or word2 in word1:
+                        partial_match += 1
+        
+        return min(1.0, jaccard + (partial_match * 0.1))
+    
+    def quick_retrieve(self, query: str, top_k: int = 5) -> List[Any]:
+        """快速检索 - 更简单直接的API"""
+        return self.retrieve(query, retrieval_type="recognition")[:top_k]
+    
+    def get_recent_memories(self, n: int = 10) -> List[Any]:
+        """获取最近的n条记忆"""
+        all_memories = []
+        for memory in self.episodic_memory.values():
+            all_memories.append(memory)
+        
+        all_memories.sort(key=lambda x: x.last_accessed, reverse=True)
+        return all_memories[:n]
     
     # ==================== 记忆提取 ====================
     
@@ -508,7 +543,7 @@ class HumanMemorySystem:
         context: Optional[Dict] = None
     ) -> List[Any]:
         """
-        记忆提取
+        记忆提取 - 优化版
         
         提取类型：
         - recall: 自由回忆
@@ -520,7 +555,8 @@ class HumanMemorySystem:
         candidates = self._search_candidates(query)
         
         if not candidates:
-            return []
+            # 更宽松的搜索
+            candidates = self._search_candidates(query, strict=False)
         
         # 应用提取机制
         if retrieval_type == "recognition":
@@ -535,50 +571,59 @@ class HumanMemorySystem:
             self.stats["successful_retrievals"] += 1
         
         # 应用系列位置效应
-        if self.serial_position_effect:
+        if self.serial_position_effect and results:
             results = self._apply_serial_position_effect(results)
         
         return results
     
-    def _search_candidates(self, query: str) -> List[Tuple[str, float, Any]]:
-        """搜索候选记忆"""
+    def _search_candidates(self, query: str, strict: bool = True) -> List[Tuple[str, float, Any]]:
+        """搜索候选记忆 - 优化版"""
         candidates = []
         
         # 搜索情景记忆
         for eid, episodic in self.episodic_memory.items():
             similarity = self._semantic_similarity(query, episodic.content)
-            candidates.append((eid, similarity, episodic))
+            # 调整阈值
+            threshold = 0.2 if strict else 0.1
+            if similarity > threshold:
+                candidates.append((eid, similarity, episodic))
         
         # 搜索语义记忆
         for sid, semantic in self.semantic_memory.items():
             similarity = self._semantic_similarity(query, semantic.concept)
-            candidates.append((sid, similarity, semantic))
+            similarity = max(similarity, self._semantic_similarity(query, semantic.definition))
+            threshold = 0.3 if strict else 0.15
+            if similarity > threshold:
+                candidates.append((sid, similarity, semantic))
         
         # 按相似度排序
         candidates.sort(key=lambda x: x[1], reverse=True)
         
+        # 返回前20个候选
         return candidates[:20]
     
     def _recognition(self, candidates: List, query: str) -> List[Any]:
-        """再认（判断是否记得）"""
+        """再认 - 优化版"""
         results = []
-        threshold = 0.3
+        threshold = 0.15
         
         for cid, similarity, memory in candidates:
             if similarity > threshold:
                 trace = self.memory_traces.get(cid)
                 if trace:
-                    trace.activation_level = min(1.0, trace.activation_level + 0.2)
-                    memory.last_accessed = time.time()
-                    memory.access_count += 1
+                    trace.strengthen(0.15)
+                    # 安全更新属性
+                    if hasattr(memory, 'last_accessed'):
+                        memory.last_accessed = time.time()
+                    if hasattr(memory, 'access_count'):
+                        memory.access_count += 1
                     results.append(memory)
         
         return results
     
     def _free_recall(self, candidates: List, query: str) -> List[Any]:
-        """自由回忆"""
+        """自由回忆 - 优化版"""
         results = []
-        threshold = 0.4
         
         for cid, similarity, memory in candidates:
             trace = self.memory_traces.get(cid)
@@ -586,12 +631,13 @@ class HumanMemorySystem:
             if not trace:
                 continue
             
-            # 计算提取概率（基于激活水平）
-            extraction_prob = trace.activation_level * trace.accessibility
+            # 计算提取概率 - 简化逻辑
+            extraction_prob = trace.activation_level * trace.accessibility * (0.5 + similarity)
             
-            if extraction_prob > threshold and random.random() < extraction_prob:
+            # 提高成功率
+            if extraction_prob > 0.2:
                 results.append(memory)
-                trace.activation_level = min(1.0, trace.activation_level + 0.1)
+                trace.strengthen(0.1)
                 
                 if hasattr(memory, 'last_accessed'):
                     memory.last_accessed = time.time()
@@ -604,7 +650,7 @@ class HumanMemorySystem:
         return results
     
     def _cued_recall(self, candidates: List, query: str, context: Optional[Dict]) -> List[Any]:
-        """线索回忆"""
+        """线索回忆 - 优化版"""
         if not context:
             return self._free_recall(candidates, query)
         
@@ -629,7 +675,13 @@ class HumanMemorySystem:
             
             if extraction_prob > 0.3:
                 results.append(memory)
-                trace.activation_level = min(1.0, trace.activation_level + context_bonus)
+                trace.strengthen(context_bonus)
+                
+                # 安全更新属性
+                if hasattr(memory, 'last_accessed'):
+                    memory.last_accessed = time.time()
+                if hasattr(memory, 'access_count'):
+                    memory.access_count += 1
         
         return results
     

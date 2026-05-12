@@ -131,7 +131,16 @@ def demonstrate_retrieval(mem):
     results = mem.retrieve("编程", retrieval_type="recall")
     print(f"      找到 {len(results)} 条记忆")
     for r in results[:3]:
-        print(f"        - {r.content[:40]}...")
+        # 处理不同类型的记忆
+        if hasattr(r, 'content'):
+            text = r.content
+        elif hasattr(r, 'concept'):
+            text = f"{r.concept}: {r.definition[:30]}"
+        elif hasattr(r, 'skill_name'):
+            text = r.skill_name
+        else:
+            text = str(r)
+        print(f"        - {text[:50]}...")
     
     print("\n  [b] 再认 '语言'")
     results = mem.retrieve("语言", retrieval_type="recognition")
