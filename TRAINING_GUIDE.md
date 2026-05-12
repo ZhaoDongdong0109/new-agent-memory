@@ -87,24 +87,21 @@ conda create -n memory-model python=3.10
 conda activate memory-model
 
 # 安装依赖
-pip install torch transformers datasets accelerate wandb
+pip install torch transformers datasets accelerate wandb tqdm
 ```
 
 ### Step 2: 准备数据
 ```bash
-python prepare_training_data.py
+python data_generator.py
 ```
 
-### Step 3: 训练模型
+### Step 3: 训练模型（自动化 - 推荐）
 ```bash
-# 训练编码器
-python train_encoder.py
+# 使用自动化训练智能体（一键启动，无需人工干预）
+python auto_trainer.py
 
-# 训练检索器
-python train_retriever.py
-
-# 训练适配器
-python train_adapter.py
+# 或者使用标准训练
+python train.py
 ```
 
 ### Step 4: 评估模型
