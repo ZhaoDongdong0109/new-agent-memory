@@ -76,14 +76,85 @@ class MemoryLayerCore:
         # 存储
         self.chunks: Dict[str, MemoryChunk] = {}
         
+        # 权重计算缓存：{chunk_id: (weight_factors, cache_time)}
+        self._weight_cache: Dict[str, Tuple[WeightFactors, float]] = {}
+        self._cache_ttl: float = 60.0  # 缓存有效期60秒
+        
+        # 多维索引（倒排索引）
+        self._index_by_location: Dict[str, Set[str]] = {}
+        self._index_by_person: Dict[str, Set[str]] = {}
+        self._index_by_topic: Dict[str, Set[str]] = {}
+        self._index_by_time_relative: Dict[str, Set[str]] = {}
+        self._index_by_time_context: Dict[str, Set[str]] = {}
+        self._index_by_memory_type: Dict[str, Set[str]] = {}
+        
+        # Hebbian 关联索引（邻接表）
+        self._association_index: Dict[str, Dict[str, float]] = {}  # chunk_id -> {associated_id -> strength}
+        
+        # 性能统计
+        self._stats = {
+            "total_weight_calculations": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "index_lookups": 0,
+            "full_scans": 0,
+        }
+        
         # 统计
         self.total_recall_success = 0
         self.total_recall_fail = 0
     
     # ============ 权重计算 ============
     
+    def _get_cached_weight(self, chunk: MemoryChunk) -> Optional[WeightFactors]:
+        """获取缓存的权重"""
+        self._stats["total_weight_calculations"] += 1
+        if chunk.id not in self._weight_cache:
+            self._stats["cache_misses"] += 1
+            return None
+        wf, cache_time = self._weight_cache[chunk.id]
+        if time.time() - cache_time > self._cache_ttl:
+            del self._weight_cache[chunk.id]
+            self._stats["cache_misses"] += 1
+            return None
+        self._stats["cache_hits"] += 1
+        return wf
+    
+    def _set_cached_weight(self, chunk: MemoryChunk, wf: WeightFactors):
+        """设置权重缓存"""
+        self._weight_cache[chunk.id] = (wf, time.time())
+    
+    def _invalidate_cache(self, chunk_id: str):
+        """使缓存失效"""
+        self._weight_cache.pop(chunk_id, None)
+    
+    def clear_cache(self):
+        """清除所有权重缓存"""
+        self._weight_cache.clear()
+    
+    def prune_indexes(self, min_usage: int = 0):
+        """清理未使用的索引条目"""
+        all_chunk_ids = set(self.chunks.keys())
+        
+        for index in [self._index_by_location, self._index_by_person, 
+                       self._index_by_topic, self._index_by_time_relative,
+                       self._index_by_time_context, self._index_by_memory_type]:
+            empty_keys = [k for k, v in index.items() if not v or not any(cid in all_chunk_ids for cid in v)]
+            for k in empty_keys:
+                del index[k]
+        
+        empty_associations = [k for k in self._association_index if k not in all_chunk_ids]
+        for k in empty_associations:
+            del self._association_index[k]
+        
+        return len(empty_keys) + len(empty_associations)
+    
     def calc_weight(self, chunk: MemoryChunk) -> WeightFactors:
         """计算记忆碎片权重"""
+        cached = self._get_cached_weight(chunk)
+        if cached:
+            return cached
+        
         age = time.time() - chunk.created_at
         
         # 时间衰减（指数衰减，关联减缓）
@@ -134,7 +205,7 @@ class MemoryLayerCore:
         )
         final = max(0.0, min(1.0, final))
         
-        return WeightFactors(
+        wf = WeightFactors(
             time_decay=time_decay,
             frequency=frequency,
             recency=recency,
@@ -144,6 +215,136 @@ class MemoryLayerCore:
             connection_boost=connection_boost,
             final=final,
         )
+        
+        self._set_cached_weight(chunk, wf)
+        return wf
+    
+    # ============ 索引管理 ============
+    
+    def _update_indexes(self, chunk: MemoryChunk):
+        """更新记忆的索引"""
+        chunk_id = chunk.id
+        
+        if chunk.location:
+            if chunk.location not in self._index_by_location:
+                self._index_by_location[chunk.location] = set()
+            self._index_by_location[chunk.location].add(chunk_id)
+        
+        for person in chunk.persons:
+            if person not in self._index_by_person:
+                self._index_by_person[person] = set()
+            self._index_by_person[person].add(chunk_id)
+        
+        for topic in chunk.topics:
+            if topic not in self._index_by_topic:
+                self._index_by_topic[topic] = set()
+            self._index_by_topic[topic].add(chunk_id)
+        
+        if chunk.time_relative:
+            if chunk.time_relative not in self._index_by_time_relative:
+                self._index_by_time_relative[chunk.time_relative] = set()
+            self._index_by_time_relative[chunk.time_relative].add(chunk_id)
+        
+        if chunk.time_context:
+            if chunk.time_context not in self._index_by_time_context:
+                self._index_by_time_context[chunk.time_context] = set()
+            self._index_by_time_context[chunk.time_context].add(chunk_id)
+        
+        mem_type_key = chunk.memory_type.value if hasattr(chunk.memory_type, 'value') else str(chunk.memory_type)
+        if mem_type_key not in self._index_by_memory_type:
+            self._index_by_memory_type[mem_type_key] = set()
+        self._index_by_memory_type[mem_type_key].add(chunk_id)
+    
+    def _remove_from_indexes(self, chunk: MemoryChunk):
+        """从索引中移除记忆"""
+        chunk_id = chunk.id
+        
+        if chunk.location and chunk_id in self._index_by_location.get(chunk.location, set()):
+            self._index_by_location[chunk.location].discard(chunk_id)
+        
+        for person in chunk.persons:
+            self._index_by_person.get(person, set()).discard(chunk_id)
+        
+        for topic in chunk.topics:
+            self._index_by_topic.get(topic, set()).discard(chunk_id)
+        
+        if chunk.time_relative:
+            self._index_by_time_relative.get(chunk.time_relative, set()).discard(chunk_id)
+        
+        if chunk.time_context:
+            self._index_by_time_context.get(chunk.time_context, set()).discard(chunk_id)
+        
+        mem_type_key = chunk.memory_type.value if hasattr(chunk.memory_type, 'value') else str(chunk.memory_type)
+        self._index_by_memory_type.get(mem_type_key, set()).discard(chunk_id)
+        
+        self._association_index.pop(chunk_id, None)
+        for other_id in self._association_index:
+            self._association_index[other_id].pop(chunk_id, None)
+    
+    def get_associated_memories(
+        self,
+        chunk_id: str,
+        min_strength: float = 0.1,
+        limit: int = 10,
+    ) -> List[Tuple[str, float]]:
+        """
+        快速获取与指定记忆关联的记忆（使用索引）
+        
+        返回：[(关联记忆ID, 关联强度), ...]，按强度降序
+        """
+        if chunk_id not in self._association_index:
+            chunk = self.chunks.get(chunk_id)
+            if chunk and chunk.associations:
+                associations = [(aid, strength) for aid, strength in chunk.associations.items() if strength >= min_strength]
+                associations.sort(key=lambda x: x[1], reverse=True)
+                return associations[:limit]
+            return []
+        
+        associations = [(aid, strength) for aid, strength in self._association_index[chunk_id].items() if strength >= min_strength]
+        associations.sort(key=lambda x: x[1], reverse=True)
+        return associations[:limit]
+    
+    def _get_candidates_from_index(self, query_tags: Dict[str, Any]) -> Set[str]:
+        """使用索引获取候选记忆ID"""
+        self._stats["index_lookups"] += 1
+        candidate_sets: List[Set[str]] = []
+        
+        if "location" in query_tags and query_tags["location"] in self._index_by_location:
+            candidate_sets.append(self._index_by_location[query_tags["location"]])
+        
+        if "persons" in query_tags:
+            for person in query_tags["persons"]:
+                if person in self._index_by_person:
+                    candidate_sets.append(self._index_by_person[person])
+        
+        if "topics" in query_tags:
+            for topic in query_tags["topics"]:
+                if topic in self._index_by_topic:
+                    candidate_sets.append(self._index_by_topic[topic])
+        
+        if "time_relative" in query_tags:
+            tr = query_tags["time_relative"]
+            if tr in self._index_by_time_relative:
+                candidate_sets.append(self._index_by_time_relative[tr])
+            if tr in self._index_by_time_context:
+                candidate_sets.append(self._index_by_time_context[tr])
+        
+        if "time_context" in query_tags:
+            tc = query_tags["time_context"]
+            if tc in self._index_by_time_context:
+                candidate_sets.append(self._index_by_time_context[tc])
+            if tc in self._index_by_time_relative:
+                candidate_sets.append(self._index_by_time_relative[tc])
+        
+        if not candidate_sets:
+            self._stats["full_scans"] += 1
+            return set(self.chunks.keys())
+        
+        if len(candidate_sets) == 1:
+            return candidate_sets[0]
+        
+        result = candidate_sets[0].intersection(*candidate_sets[1:])
+        return result if result else set(self.chunks.keys())
     
     # ============ 记忆操作 ============
     
@@ -152,6 +353,8 @@ class MemoryLayerCore:
         if chunk.layer != MemoryLayer.CORE:
             chunk.layer = MemoryLayer.CORE
         self.chunks[chunk.id] = chunk
+        self._invalidate_cache(chunk.id)
+        self._update_indexes(chunk)
         return chunk.id
     
     def get(self, chunk_id: str) -> Optional[MemoryChunk]:
@@ -164,10 +367,15 @@ class MemoryLayerCore:
         if not chunk:
             return None
         chunk.access()
+        self._invalidate_cache(chunk_id)
         return chunk, self.calc_weight(chunk)
     
     def remove(self, chunk_id: str) -> Optional[MemoryChunk]:
         """删除记忆"""
+        chunk = self.chunks.get(chunk_id)
+        if chunk:
+            self._remove_from_indexes(chunk)
+        self._invalidate_cache(chunk_id)
         return self.chunks.pop(chunk_id, None)
     
     # ============ 检索 ============
@@ -179,13 +387,17 @@ class MemoryLayerCore:
         limit: int = 10,
     ) -> List[Tuple[MemoryChunk, WeightFactors]]:
         """
-        基于标签检索记忆
+        基于标签检索记忆（使用索引优化）
         
         返回：[(碎片, 权重), ...]，按权重降序
         """
+        candidate_ids = self._get_candidates_from_index(query_tags)
         candidates = []
         
-        for chunk in self.chunks.values():
+        for chunk_id in candidate_ids:
+            chunk = self.chunks.get(chunk_id)
+            if not chunk:
+                continue
             if not chunk.matches_query(query_tags):
                 continue
             
@@ -211,12 +423,18 @@ class MemoryLayerCore:
         if not chunk_a or not chunk_b:
             return
         
-        # 双向增强
         current_a = chunk_a.associations.get(chunk_id_b, 0.0)
         current_b = chunk_b.associations.get(chunk_id_a, 0.0)
         
         chunk_a.associations[chunk_id_b] = min(1.0, current_a + strength * (1 - current_a))
         chunk_b.associations[chunk_id_a] = min(1.0, current_b + strength * (1 - current_b))
+        
+        if chunk_id_a not in self._association_index:
+            self._association_index[chunk_id_a] = {}
+        if chunk_id_b not in self._association_index:
+            self._association_index[chunk_id_b] = {}
+        self._association_index[chunk_id_a][chunk_id_b] = chunk_a.associations[chunk_id_b]
+        self._association_index[chunk_id_b][chunk_id_a] = chunk_b.associations[chunk_id_a]
     
     def weaken_association(self, chunk_id_a: str, chunk_id_b: str, strength: float = 0.05):
         """Hebbian减弱：长期不一起使用则衰减"""
@@ -229,6 +447,11 @@ class MemoryLayerCore:
             chunk_a.associations[chunk_id_b] = max(0.0, chunk_a.associations[chunk_id_b] - strength)
         if chunk_id_a in chunk_b.associations:
             chunk_b.associations[chunk_id_a] = max(0.0, chunk_b.associations[chunk_id_a] - strength)
+        
+        if chunk_id_a in self._association_index and chunk_id_b in self._association_index[chunk_id_a]:
+            self._association_index[chunk_id_a][chunk_id_b] = chunk_a.associations.get(chunk_id_b, 0.0)
+        if chunk_id_b in self._association_index and chunk_id_a in self._association_index[chunk_id_b]:
+            self._association_index[chunk_id_b][chunk_id_a] = chunk_b.associations.get(chunk_id_a, 0.0)
     
     def access_together(self, chunk_ids: List[str]):
         """同时访问多个记忆（触发Hebbian增强）"""
@@ -302,6 +525,7 @@ class MemoryLayerCore:
             if chunk_id in self.chunks:
                 chunk = self.chunks.pop(chunk_id)
                 chunk.layer = MemoryLayer.FORGOTTEN
+                self._invalidate_cache(chunk_id)
                 degraded.append(chunk)
         return degraded
     
@@ -335,9 +559,79 @@ class MemoryLayerCore:
             self.total_recall_success = stats.get("total_recall_success", 0)
             self.total_recall_fail = stats.get("total_recall_fail", 0)
             
+            self._rebuild_indexes()
             return True
         except FileNotFoundError:
             return False
     
+    def _rebuild_indexes(self):
+        """重建所有索引"""
+        self._index_by_location.clear()
+        self._index_by_person.clear()
+        self._index_by_topic.clear()
+        self._index_by_time_relative.clear()
+        self._index_by_time_context.clear()
+        self._index_by_memory_type.clear()
+        self._association_index.clear()
+        
+        for chunk in self.chunks.values():
+            self._update_indexes(chunk)
+            if chunk.associations:
+                self._association_index[chunk.id] = dict(chunk.associations)
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """获取性能统计"""
+        total = self._stats["total_weight_calculations"]
+        return {
+            "weight_calculations": total,
+            "cache_hits": self._stats["cache_hits"],
+            "cache_misses": self._stats["cache_misses"],
+            "cache_hit_rate": self._stats["cache_hits"] / max(1, total),
+            "index_lookups": self._stats["index_lookups"],
+            "full_scans": self._stats["full_scans"],
+        }
+    
+    def reset_performance_stats(self):
+        """重置性能统计"""
+        self._stats = {
+            "total_weight_calculations": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "index_lookups": 0,
+            "full_scans": 0,
+        }
+    
     def __len__(self) -> int:
         return len(self.chunks)
+    
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """获取内存统计"""
+        import sys
+        total_size = sys.getsizeof(self.chunks)
+        
+        chunk_sizes = []
+        for chunk in self.chunks.values():
+            chunk_size = (
+                sys.getsizeof(chunk.content) +
+                sys.getsizeof(chunk.associations) +
+                sys.getsizeof(chunk.persons) +
+                sys.getsizeof(chunk.topics) +
+                sys.getsizeof(chunk.metadata)
+            )
+            chunk_sizes.append(chunk_size)
+        
+        index_sizes = {
+            "location": sys.getsizeof(self._index_by_location),
+            "person": sys.getsizeof(self._index_by_person),
+            "topic": sys.getsizeof(self._index_by_topic),
+            "association": sys.getsizeof(self._association_index),
+        }
+        
+        return {
+            "total_chunks": len(self.chunks),
+            "estimated_memory_mb": total_size / 1024 / 1024,
+            "avg_chunk_size_bytes": sum(chunk_sizes) / max(1, len(chunk_sizes)),
+            "index_memory_mb": sum(index_sizes.values()) / 1024 / 1024,
+            "cache_entries": len(self._weight_cache),
+            "cache_memory_bytes": len(self._weight_cache) * sys.getsizeof(WeightFactors()),
+        }

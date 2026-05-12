@@ -63,7 +63,7 @@ class QueryContext:
     
     def to_tags(self) -> Dict[str, Any]:
         """转换为检索标签"""
-        tags = {}
+        tags: Dict[str, Any] = {}
         if self.time_absolute:
             tags["time_absolute"] = self.time_absolute
         if self.time_relative:
@@ -542,10 +542,14 @@ class MemoryRetrieval:
     
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
+        total = self.total_retrievals
         return {
-            "total_retrievals": self.total_retrievals,
-            "core_hit_rate": self.core_hit / max(1, self.total_retrievals),
-            "forgotten_hit_rate": self.forgotten_hit / max(1, self.total_retrievals),
+            "total_retrievals": total,
+            "core_hit": self.core_hit,
+            "forgotten_hit": self.forgotten_hit,
+            "both_hit": self.both_hit,
+            "core_hit_rate": self.core_hit / max(1, total),
+            "forgotten_hit_rate": self.forgotten_hit / max(1, total),
             "core_chunks": len(self.core),
             "forgotten_chunks": len(self.forgotten),
         }

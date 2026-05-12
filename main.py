@@ -151,6 +151,39 @@ class HumanLikeMemorySystem:
         
         return chunk.id
     
+    def add_memories_batch(
+        self,
+        memories: List[Dict[str, Any]],
+    ) -> List[str]:
+        """
+        批量添加记忆
+        
+        memories: 记忆列表，每个字典包含 add_memory 的参数
+        返回：添加的记忆ID列表
+        """
+        chunk_ids = []
+        for mem_data in memories:
+            chunk = MemoryChunk(
+                content=mem_data.get("content", ""),
+                memory_type=mem_data.get("memory_type", MemoryType.INTERACTION),
+                time_absolute=mem_data.get("time_absolute"),
+                time_relative=mem_data.get("time_relative"),
+                time_context=mem_data.get("time_context"),
+                location=mem_data.get("location"),
+                location_detail=mem_data.get("location_detail"),
+                persons=set(mem_data.get("persons", [])),
+                topics=set(mem_data.get("topics", [])),
+                keywords=set(mem_data.get("keywords", [])),
+                emotion_valence=mem_data.get("emotion_valence", 0.0),
+                emotion_intensity=mem_data.get("emotion_intensity", 0.0),
+                importance=mem_data.get("importance", 0.5),
+                metadata=mem_data.get("metadata", {}),
+            )
+            self.core.add(chunk)
+            chunk_ids.append(chunk.id)
+        
+        return chunk_ids
+    
     def retrieve(
         self,
         query: str,
@@ -244,28 +277,10 @@ class HumanLikeMemorySystem:
         return assembled
     
     def _review_chunks(self, chunks, assembled, ctx):
-        """审阅碎片"""
-        import math
-        confidence = 0.0
-        
-        if len(chunks) == 1:
-            confidence += 0.3
-        elif len(chunks) <= 3:
-            confidence += 0.4
-        else:
-            confidence += 0.5
-        
-        avg_importance = sum(c.importance for c in chunks) / len(chunks)
-        confidence += avg_importance * 0.3
-        
-        total_recalls = sum(c.successful_recall_count for c in chunks)
-        confidence += min(0.2, total_recalls * 0.05)
-        
-        confidence = max(0.0, min(1.0, confidence))
-        
-        if confidence >= 0.5:
-            return ReviewResult.APPROVED, confidence
-        return ReviewResult.QUESTIONABLE, confidence
+        """审阅碎片 - 委托给 retrieval 模块"""
+        if not chunks:
+            return ReviewResult.REJECTED, 0.0
+        return self.retrieval._review(chunks, assembled, ctx)
     
     def feedback(
         self,
