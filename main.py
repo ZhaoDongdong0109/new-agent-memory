@@ -13,6 +13,7 @@ from forgotten_layer import ForgottenLayer
 from retrieval import MemoryRetrieval, QueryContext, ReconstructionResult, ReviewResult
 from core.weight_system import MemoryType
 from core.persona_layer import PersonaLayer, BehaviorType
+from core.attention_system import AttentionOS, FocusWorkspace, Goal, ProcedureMemory
 
 
 class HumanLikeMemorySystem:
@@ -75,6 +76,9 @@ class HumanLikeMemorySystem:
         
         # 人格适应层
         self.persona = PersonaLayer()
+
+        # 目标驱动注意力调度层
+        self.attention = AttentionOS()
         
         # 定时任务
         self.last_maintenance = time.time()
@@ -297,6 +301,86 @@ class HumanLikeMemorySystem:
     def get_persona_summary(self) -> Dict[str, Any]:
         """获取人格适应层摘要"""
         return self.persona.get_profile_summary()
+
+    # ============ 注意力调度 ============
+
+    def start_goal(
+        self,
+        objective: str,
+        constraints: Optional[List[str]] = None,
+        open_loops: Optional[List[str]] = None,
+        priority: float = 0.7,
+    ) -> Goal:
+        """开始一个会影响注意力选择的目标"""
+        return self.attention.start_goal(objective, constraints, open_loops, priority)
+
+    def update_goal(
+        self,
+        goal_id: str,
+        status: Optional[str] = None,
+        evidence: Optional[List[str]] = None,
+        open_loops: Optional[List[str]] = None,
+    ) -> Optional[Goal]:
+        """更新目标状态、证据或未闭环事项"""
+        return self.attention.update_goal(
+            goal_id,
+            status=status,
+            evidence=evidence,
+            open_loops=open_loops,
+        )
+
+    def add_procedure(
+        self,
+        title: str,
+        steps: List[str],
+        triggers: Optional[List[str]] = None,
+        importance: float = 0.6,
+        confidence: float = 0.6,
+    ) -> ProcedureMemory:
+        """添加一条程序记忆，也就是系统学会的一种做事方式"""
+        return self.attention.add_procedure(
+            title=title,
+            steps=steps,
+            triggers=triggers,
+            importance=importance,
+            confidence=confidence,
+        )
+
+    def record_procedure_use(self, procedure_id: str, success: Optional[bool] = None) -> bool:
+        """记录程序记忆是否帮上忙，用于更新置信度"""
+        return self.attention.record_procedure_use(procedure_id, success)
+
+    def focus(
+        self,
+        query: str,
+        memory_limit: int = 5,
+        procedure_limit: int = 3,
+        include_forgotten: bool = False,
+    ) -> FocusWorkspace:
+        """
+        构建本轮注意力工作区。
+
+        它不会直接生成回答，而是决定当前目标下哪些记忆和程序应该进入上下文。
+        """
+        chunks = list(self.core.chunks.values())
+        if include_forgotten:
+            chunks.extend(self.forgotten.chunks.values())
+        return self.attention.build_focus(
+            query=query,
+            memories=chunks,
+            memory_limit=memory_limit,
+            procedure_limit=procedure_limit,
+        )
+
+    def get_attention_summary(self) -> Dict[str, Any]:
+        """获取注意力调度层摘要"""
+        active_goal = self.attention.goal_stack.active()
+        return {
+            "active_goal": active_goal.to_dict() if active_goal else None,
+            "goals": [goal.to_dict() for goal in self.attention.goal_stack.goals],
+            "procedures": [procedure.to_dict() for procedure in self.attention.procedures],
+            "workspace_history_count": len(self.attention.workspace_history),
+        }
     
     # ============ 维护 ============
     
@@ -345,6 +429,11 @@ class HumanLikeMemorySystem:
         persona_path = f"{self.data_dir}/persona.json"
         with open(persona_path, 'w', encoding='utf-8') as f:
             json.dump(self.persona.export_profile(), f, ensure_ascii=False, indent=2)
+
+        # 保存注意力调度层
+        attention_path = f"{self.data_dir}/attention.json"
+        with open(attention_path, 'w', encoding='utf-8') as f:
+            json.dump(self.attention.to_dict(), f, ensure_ascii=False, indent=2)
     
     def load(self) -> bool:
         """加载数据"""
@@ -354,6 +443,7 @@ class HumanLikeMemorySystem:
         core_path = f"{self.data_dir}/core.json"
         forgotten_path = f"{self.data_dir}/forgotten.json"
         persona_path = f"{self.data_dir}/persona.json"
+        attention_path = f"{self.data_dir}/attention.json"
         
         core_loaded = self.core.load(core_path) if os.path.exists(core_path) else False
         forgotten_loaded = self.forgotten.load(forgotten_path) if os.path.exists(forgotten_path) else False
@@ -368,8 +458,19 @@ class HumanLikeMemorySystem:
                 persona_loaded = True
             except Exception:
                 pass
+
+        # 加载注意力调度层
+        attention_loaded = False
+        if os.path.exists(attention_path):
+            try:
+                with open(attention_path, 'r', encoding='utf-8') as f:
+                    attention_data = json.load(f)
+                self.attention = AttentionOS.from_dict(attention_data)
+                attention_loaded = True
+            except Exception:
+                pass
         
-        return core_loaded or forgotten_loaded or persona_loaded
+        return core_loaded or forgotten_loaded or persona_loaded or attention_loaded
     
     # ============ 统计 ============
     
@@ -388,6 +489,7 @@ class HumanLikeMemorySystem:
             },
             "retrieval_stats": self.retrieval.get_stats(),
             "persona_summary": self.persona.get_profile_summary(),
+            "attention_summary": self.get_attention_summary(),
         }
     
     def get_recent_memories(self, limit: int = 10) -> List[Dict]:
