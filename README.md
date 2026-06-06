@@ -15,7 +15,7 @@ Explainable human-like memory layer for AI agents.
 - 用户重新给出线索时，系统怎样把它唤醒？
 - 用户不喜欢主动提旧事时，系统怎样逐渐收敛？
 
-核心定位：**可解释的记忆衰减与线索唤醒机制**。
+核心定位：**可解释的记忆衰减、线索唤醒与目标驱动注意力调度**。
 
 ## Features
 
@@ -23,7 +23,11 @@ Explainable human-like memory layer for AI agents.
 - **伪遗忘层**：低权重记忆不主动占用核心空间，但可被地点、人物、主题等锚点唤醒。
 - **自适应权重**：结合时间衰减、访问频率、近因效应、情绪强度、关联密度和重要性。
 - **人格适应层**：通过用户反馈学习是否应该主动提及旧记忆。
-- **可持久化**：核心层、伪遗忘层和人格偏好可以保存到 JSON。
+- **GoalStack**：维护当前目标、约束、证据和未闭环事项，让系统知道“现在正在干什么”。
+- **程序记忆**：保存可复用的做事方式，例如测试、提交、发布、排查问题的流程。
+- **注意力工作区**：按目标相关度、查询相关度、重要性、近因、频率和干扰惩罚选择上下文。
+- **审计轨迹**：每次进入工作区的记忆和程序都会带有分数拆解，便于解释为什么被选中。
+- **可持久化**：核心层、伪遗忘层、人格偏好和注意力状态可以保存到 JSON。
 - **轻量高性能检索**：核心层内置倒排索引、短期权重缓存、候选集限制和早期退出。
 
 ## Install
@@ -69,12 +73,49 @@ print(result.assembled_content)
 今天中午和客户在北京餐厅吃了烤鸭，聊了项目预算。
 ```
 
+## Attention Workspace
+
+如果普通检索回答的是“记得什么”，注意力工作区回答的是“现在该想什么”。
+
+```python
+from new_agent_memory import HumanLikeMemorySystem, MemoryType
+
+memory = HumanLikeMemorySystem()
+
+memory.start_goal(
+    "修复测试失败并安全推送 PR",
+    constraints=["先跑 pytest", "检查 git diff", "不要直接改 main"],
+    open_loops=["PR 还没创建"],
+)
+
+memory.add_memory(
+    content="上次 maintain() 失败是因为核心层缺少 decay_all_unused()。",
+    memory_type=MemoryType.FACT,
+    topics=["pytest", "maintenance", "bugfix"],
+    importance=0.75,
+)
+
+memory.add_procedure(
+    title="Safe PR workflow",
+    steps=["run pytest", "run examples", "check git diff", "commit", "push branch"],
+    triggers=["pytest", "tests", "PR", "push"],
+    importance=0.85,
+    confidence=0.8,
+)
+
+workspace = memory.focus("pytest 失败后怎么继续")
+print(workspace.to_prompt_context())
+```
+
+输出会包含当前目标、应该带入上下文的程序记忆、以及真正相关的记忆。无关但重要的偏好会被审计记录下来，但不会自动进入工作区。
+
 ## Examples
 
 ```bash
 python examples/simple_memory.py
 python examples/forgotten_recall.py
 python examples/persona_adaptation.py
+python examples/attention_workspace.py
 ```
 
 示例覆盖：
@@ -82,6 +123,7 @@ python examples/persona_adaptation.py
 - 添加记忆并检索
 - 伪遗忘层被线索唤醒
 - 用户反馈改变主动回忆偏好
+- 目标驱动的注意力工作区
 
 ## Architecture
 
@@ -89,17 +131,20 @@ python examples/persona_adaptation.py
 用户输入
   |
   v
-意图/线索解析
+目标栈 + 意图/线索解析
   |
   v
-核心记忆层 --命中--> 组装与审阅 --> 输出
+注意力门控 --选择--> 工作区上下文
   |
-  | 未命中
-  v
-伪遗忘层 --锚点唤醒--> 组装与审阅 --> 输出
+  +--> 程序记忆
+  +--> 核心记忆层
+  +--> 必要时唤醒伪遗忘层
   |
   v
-人格适应层收集反馈，调整主动回忆偏好
+组装与审阅 --> 输出
+  |
+  v
+反馈更新：人格偏好 / 程序置信度 / 记忆权重
 ```
 
 模块结构：
@@ -112,6 +157,7 @@ new-agent-memory/
 ├── forgotten_layer.py         # 伪遗忘层与线索唤醒
 ├── retrieval.py               # 查询解析、检索、组装、审阅
 ├── core/
+│   ├── attention_system.py    # GoalStack、程序记忆、注意力评分与工作区
 │   ├── weight_system.py       # 自适应权重系统实验
 │   ├── emotion_engine.py      # 情绪推断与情绪系数采样
 │   └── persona_layer.py       # 行为反馈与人格适应
@@ -135,6 +181,31 @@ effective_weight =
 ```
 
 当核心记忆权重低于阈值时，它会降级到伪遗忘层。伪遗忘层不会主动参与普通检索，但当查询里出现足够强的锚点，例如地点、人物、主题，系统可以重新唤醒这段记忆。
+
+## Attention Model
+
+注意力工作区使用可解释分数，而不是黑盒排序：
+
+```text
+attention_score =
+  goal_relevance
+  + query_relevance
+  + user_importance
+  + recency
+  + frequency
+  + emotional_salience
+  + uncertainty_need
+  + novelty
+  - distraction_penalty
+  - staleness_penalty
+```
+
+这让系统可以做到：
+
+- 当前目标相关的记忆优先进入上下文
+- 程序记忆在触发词出现时被带入，例如 `pytest`、`release`、`PR`
+- 重要但无关的记忆会被干扰惩罚挡住
+- 每次选择都有 audit，可解释分数来源
 
 ## Performance Notes
 
@@ -162,6 +233,8 @@ python -m compileall .
 - 伪遗忘层线索唤醒
 - 保存与加载
 - 人格正反馈提升兴趣度
+- 目标驱动注意力门控
+- 注意力状态持久化
 
 ## Roadmap
 
@@ -169,6 +242,7 @@ python -m compileall .
 - [x] 核心层索引、缓存和早期退出
 - [x] 基础测试与 GitHub Actions
 - [x] 可运行 examples
+- [x] GoalStack、程序记忆和注意力工作区
 - [ ] CLI：`memory add/search/stats`
 - [ ] SQLite 持久化后端
 - [ ] 更强的自然语言线索解析
@@ -178,9 +252,10 @@ python -m compileall .
 
 ## Positioning
 
-这个项目不是 Mem0、Zep、LangChain Memory 的替代品，而是一个更小、更可解释的类人记忆机制实验。它适合用于：
+这个项目不是 Mem0、Zep、LangChain Memory 的替代品，而是一个更小、更可解释的类人记忆与注意力机制实验。它适合用于：
 
 - 学习长期记忆系统怎么分层、衰减、唤醒
+- 研究 Agent 如何在有限上下文里决定“现在该想什么”
 - 给个人 Agent 增加可解释的长期记忆原型
 - 研究“遗忘机制”本身，而不是只研究语义检索
 

@@ -3,15 +3,20 @@
 from main import HumanLikeMemorySystem
 from memory_chunk import MemoryChunk, MemoryLayer
 from retrieval import ReconstructionResult, ReviewResult
+from core.attention_system import AttentionOS, FocusWorkspace, Goal, ProcedureMemory
 from core.weight_system import MemoryType
 
 __version__ = "0.1.0"
 
 __all__ = [
     "HumanLikeMemorySystem",
+    "AttentionOS",
+    "FocusWorkspace",
+    "Goal",
     "MemoryChunk",
     "MemoryLayer",
     "MemoryType",
+    "ProcedureMemory",
     "ReconstructionResult",
     "ReviewResult",
     "__version__",
