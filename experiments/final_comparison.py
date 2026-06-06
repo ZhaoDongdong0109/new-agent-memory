@@ -1,10 +1,14 @@
 """
-最终对比测试：原始版本 vs 优化v2
+最终对比测试：主线核心层 vs 实验优化v2
 """
 
 import sys
-sys.path.insert(0, '/tmp/memory-prototype')
-sys.path.insert(0, '/root/new-agent-memory/experiments')
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+EXPERIMENTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(EXPERIMENTS))
 
 import time
 import random
@@ -55,7 +59,7 @@ def benchmark_retrieval(core, queries: list, n_iterations: int = 100):
 
 def run_final_comparison():
     print("=" * 70)
-    print("最终性能对比测试：原始版本 vs 优化v2")
+    print("最终性能对比测试：主线核心层 vs 实验优化v2")
     print("=" * 70)
     
     # 查询集（包含有索引和无索引的查询）
@@ -80,8 +84,8 @@ def run_final_comparison():
         print(f"[规模: {scale:,} 条记忆]")
         print("-" * 60)
         
-        # ========== 原始版本 ==========
-        print("  初始化原始版本...")
+        # ========== 主线核心层 ==========
+        print("  初始化主线核心层...")
         t0 = time.perf_counter()
         original = MemoryLayerCore()
         for i in range(scale):
@@ -96,8 +100,8 @@ def run_final_comparison():
                     original.strengthen_association(cid, target)
         init_time_orig = time.perf_counter() - t0
         
-        # ========== 优化版本 ==========
-        print("  初始化优化版本...")
+        # ========== 实验优化v2 ==========
+        print("  初始化实验优化v2...")
         t0 = time.perf_counter()
         optimized = OptimizedV2MemoryLayerCore(
             max_scan_candidates=min(200, scale),
@@ -125,12 +129,12 @@ def run_final_comparison():
         orig_assocs = sum(len(c.associations) for c in original.chunks.values())
         opt_stats_info = optimized.get_stats()
         
-        print(f"\n  原始版本:")
+        print(f"\n  主线核心层:")
         print(f"    初始化: {init_time_orig:.2f}s")
         print(f"    关联数: {orig_assocs:,}")
         print(f"    检索延迟: mean={orig_stats['mean_ms']:.2f}ms, p95={orig_stats['p95_ms']:.2f}ms, p99={orig_stats['p99_ms']:.2f}ms")
         
-        print(f"\n  优化版本:")
+        print(f"\n  实验优化v2:")
         print(f"    初始化: {init_time_opt:.2f}s")
         print(f"    关联数: {sum(len(c.associations) for c in optimized.chunks.values()):,}")
         print(f"    缓存大小: {opt_stats_info['weight_cache_size']:,}")
@@ -139,7 +143,7 @@ def run_final_comparison():
         p95_improvement = (1 - opt_stats['p95_ms'] / max(orig_stats['p95_ms'], 0.001)) * 100
         mean_improvement = (1 - opt_stats['mean_ms'] / max(orig_stats['mean_ms'], 0.001)) * 100
         
-        print(f"\n  性能提升:")
+        print(f"\n  实验v2相对主线:")
         print(f"    平均延迟: {mean_improvement:+.1f}%")
         print(f"    P95延迟:  {p95_improvement:+.1f}%")
         
@@ -158,7 +162,7 @@ def run_final_comparison():
     print("最终总结")
     print("=" * 70)
     
-    print(f"\n{'规模':>8} | {'原始p95':>12} | {'优化p95':>12} | {'提升':>10}")
+    print(f"\n{'规模':>8} | {'主线p95':>12} | {'实验p95':>12} | {'差异':>10}")
     print("-" * 50)
     for r in results:
         sign = "+" if r['p95_improvement'] > 0 else ""
@@ -168,14 +172,14 @@ def run_final_comparison():
               f"{sign}{r['p95_improvement']:>8.1f}%")
     
     avg_improvement = sum(r['p95_improvement'] for r in results) / len(results)
-    print(f"\n平均P95性能变化: {avg_improvement:+.1f}%")
+    print(f"\n平均P95差异: {avg_improvement:+.1f}%")
     
     if avg_improvement > 10:
-        print("\n✓ 优化版本有明显提升！")
+        print("\n[OK] 实验v2相对主线有明显提升！")
     elif avg_improvement > 0:
-        print("\n✓ 优化版本略有提升")
+        print("\n[OK] 实验v2相对主线略有提升")
     else:
-        print("\n⚠ 优化版本无提升，需要进一步分析")
+        print("\n[WARN] 实验v2相对主线无提升，需要进一步分析")
 
 
 if __name__ == "__main__":

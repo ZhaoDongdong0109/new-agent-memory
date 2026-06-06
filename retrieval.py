@@ -154,11 +154,12 @@ class MemoryRetrieval:
         目前是简化版规则解析，未来可以换成LLM
         """
         ctx = QueryContext(raw_query=query)
+        current_year = time.localtime().tm_year
         
         # 相对时间解析
         time_relative_patterns = {
-            r"(\d+)年前": lambda m: f"{2026 - int(m.group(1))}年",
-            r"(\d+)年前.*中午": lambda m: f"{2026 - int(m.group(1))}年",
+            r"(\d+)年前": lambda m: f"{current_year - int(m.group(1))}年",
+            r"(\d+)年前.*中午": lambda m: f"{current_year - int(m.group(1))}年",
             r"昨天": lambda _: "昨天",
             r"上周": lambda _: "上周",
             r"上个月": lambda _: "上个月",

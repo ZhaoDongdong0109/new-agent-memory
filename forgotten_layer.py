@@ -282,7 +282,8 @@ class ForgottenLayer:
         
         type_counts: Dict[str, int] = {}
         for chunk in self.chunks.values():
-            type_counts[chunk.memory_type] = type_counts.get(chunk.memory_type, 0) + 1
+            type_key = getattr(chunk.memory_type, "value", chunk.memory_type)
+            type_counts[type_key] = type_counts.get(type_key, 0) + 1
         
         return ForgottenLayerStats(
             total_chunks=len(self.chunks),

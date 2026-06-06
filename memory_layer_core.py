@@ -31,6 +31,13 @@ class WeightFactors:
     final: float = 0.0
 
 
+@dataclass
+class CachedWeight:
+    """带时间戳的权重缓存"""
+    factors: WeightFactors
+    calculated_at: float
+
+
 class MemoryLayerCore:
     """
     核心记忆层
@@ -52,6 +59,11 @@ class MemoryLayerCore:
         
         # 降级参数
         degrade_threshold: float = 0.15,             # 权重低于此值降级到伪遗忘层
+
+        # 检索优化参数
+        max_scan_candidates: int = 200,
+        early_exit_k: int = 20,
+        cache_ttl: float = 60.0,
         
         # 权重组合
         weights: Optional[Dict[str, float]] = None,
@@ -62,6 +74,9 @@ class MemoryLayerCore:
         self.recency_window = recency_window
         self.assoc_stability = assoc_stability
         self.degrade_threshold = degrade_threshold
+        self.max_scan_candidates = max_scan_candidates
+        self.early_exit_k = early_exit_k
+        self.cache_ttl = cache_ttl
         
         self.coeffs = weights or {
             'time_decay': 0.20,
@@ -75,6 +90,18 @@ class MemoryLayerCore:
         
         # 存储
         self.chunks: Dict[str, MemoryChunk] = {}
+        self.all_ids: List[str] = []
+
+        # 多级倒排索引，用于在检索前缩小候选集
+        self.time_index: Dict[str, Set[str]] = {}
+        self.time_relative_index: Dict[str, Set[str]] = {}
+        self.time_context_index: Dict[str, Set[str]] = {}
+        self.topic_index: Dict[str, Set[str]] = {}
+        self.location_index: Dict[str, Set[str]] = {}
+        self.person_index: Dict[str, Set[str]] = {}
+
+        # 权重计算会频繁触发，短期缓存能避免重复扫描时反复计算
+        self.weight_cache: Dict[str, CachedWeight] = {}
         
         # 统计
         self.total_recall_success = 0
@@ -84,6 +111,10 @@ class MemoryLayerCore:
     
     def calc_weight(self, chunk: MemoryChunk) -> WeightFactors:
         """计算记忆碎片权重"""
+        cached = self.weight_cache.get(chunk.id)
+        if cached and time.time() - cached.calculated_at < self.cache_ttl:
+            return cached.factors
+
         age = time.time() - chunk.created_at
         
         # 时间衰减（指数衰减，关联减缓）
@@ -134,7 +165,7 @@ class MemoryLayerCore:
         )
         final = max(0.0, min(1.0, final))
         
-        return WeightFactors(
+        factors = WeightFactors(
             time_decay=time_decay,
             frequency=frequency,
             recency=recency,
@@ -144,14 +175,133 @@ class MemoryLayerCore:
             connection_boost=connection_boost,
             final=final,
         )
+        self.weight_cache[chunk.id] = CachedWeight(factors=factors, calculated_at=time.time())
+        return factors
+
+    def _invalidate_weight(self, chunk_id: str):
+        """清除单条记忆的权重缓存"""
+        self.weight_cache.pop(chunk_id, None)
+
+    def _add_to_index(self, chunk: MemoryChunk):
+        """把记忆加入倒排索引"""
+        if chunk.id not in self.all_ids:
+            self.all_ids.append(chunk.id)
+
+        if chunk.time_absolute:
+            year_month = chunk.time_absolute[:7]
+            self.time_index.setdefault(year_month, set()).add(chunk.id)
+
+        if chunk.time_relative:
+            self.time_relative_index.setdefault(chunk.time_relative, set()).add(chunk.id)
+
+        if chunk.time_context:
+            self.time_context_index.setdefault(chunk.time_context, set()).add(chunk.id)
+
+        for topic in chunk.topics:
+            self.topic_index.setdefault(topic, set()).add(chunk.id)
+
+        if chunk.location:
+            self.location_index.setdefault(chunk.location, set()).add(chunk.id)
+
+        for person in chunk.persons:
+            self.person_index.setdefault(person, set()).add(chunk.id)
+
+    def _remove_from_index(self, chunk: MemoryChunk):
+        """从倒排索引移除记忆"""
+        if chunk.id in self.all_ids:
+            self.all_ids.remove(chunk.id)
+
+        if chunk.time_absolute:
+            year_month = chunk.time_absolute[:7]
+            if year_month in self.time_index:
+                self.time_index[year_month].discard(chunk.id)
+
+        if chunk.time_relative and chunk.time_relative in self.time_relative_index:
+            self.time_relative_index[chunk.time_relative].discard(chunk.id)
+
+        if chunk.time_context and chunk.time_context in self.time_context_index:
+            self.time_context_index[chunk.time_context].discard(chunk.id)
+
+        for topic in chunk.topics:
+            if topic in self.topic_index:
+                self.topic_index[topic].discard(chunk.id)
+
+        if chunk.location and chunk.location in self.location_index:
+            self.location_index[chunk.location].discard(chunk.id)
+
+        for person in chunk.persons:
+            if person in self.person_index:
+                self.person_index[person].discard(chunk.id)
+
+        self._invalidate_weight(chunk.id)
+
+    def _rebuild_indexes(self):
+        """加载持久化数据后重建所有索引"""
+        self.all_ids = []
+        self.time_index.clear()
+        self.time_relative_index.clear()
+        self.time_context_index.clear()
+        self.topic_index.clear()
+        self.location_index.clear()
+        self.person_index.clear()
+        self.weight_cache.clear()
+        for chunk in self.chunks.values():
+            self._add_to_index(chunk)
+
+    def _select_candidates(self, query_tags: Dict[str, Any]) -> List[str]:
+        """
+        基于索引选择候选集。
+
+        多个索引命中时取交集；没有索引可用时退回受限扫描，避免全量遍历。
+        """
+        buckets: List[Set[str]] = []
+
+        if "time_absolute" in query_tags:
+            year_month = query_tags["time_absolute"][:7]
+            buckets.append(set(self.time_index.get(year_month, set())))
+
+        if "time_relative" in query_tags:
+            buckets.append(set(self.time_relative_index.get(query_tags["time_relative"], set())))
+
+        if "time_context" in query_tags:
+            buckets.append(set(self.time_context_index.get(query_tags["time_context"], set())))
+
+        if "topics" in query_tags:
+            topic_bucket: Set[str] = set()
+            for topic in query_tags["topics"]:
+                topic_bucket.update(self.topic_index.get(topic, set()))
+            buckets.append(topic_bucket)
+
+        if "location" in query_tags:
+            buckets.append(set(self.location_index.get(query_tags["location"], set())))
+
+        if "persons" in query_tags:
+            person_bucket: Set[str] = set()
+            for person in query_tags["persons"]:
+                person_bucket.update(self.person_index.get(person, set()))
+            buckets.append(person_bucket)
+
+        non_empty = [bucket for bucket in buckets if bucket]
+        if non_empty:
+            candidates = set.intersection(*non_empty)
+            if not candidates:
+                candidates = set.union(*non_empty)
+            return list(candidates)[:self.max_scan_candidates]
+
+        return self.all_ids[:self.max_scan_candidates]
     
     # ============ 记忆操作 ============
     
     def add(self, chunk: MemoryChunk) -> str:
         """添加记忆"""
+        existing = self.chunks.get(chunk.id)
+        if existing:
+            self._remove_from_index(existing)
+
         if chunk.layer != MemoryLayer.CORE:
             chunk.layer = MemoryLayer.CORE
         self.chunks[chunk.id] = chunk
+        self._add_to_index(chunk)
         return chunk.id
     
     def get(self, chunk_id: str) -> Optional[MemoryChunk]:
@@ -164,11 +314,15 @@ class MemoryLayerCore:
         if not chunk:
             return None
         chunk.access()
+        self._invalidate_weight(chunk.id)
         return chunk, self.calc_weight(chunk)
     
     def remove(self, chunk_id: str) -> Optional[MemoryChunk]:
         """删除记忆"""
-        return self.chunks.pop(chunk_id, None)
+        chunk = self.chunks.pop(chunk_id, None)
+        if chunk:
+            self._remove_from_index(chunk)
+        return chunk
     
     # ============ 检索 ============
     
@@ -185,9 +339,17 @@ class MemoryLayerCore:
         """
         candidates = []
         
-        for chunk in self.chunks.values():
+        matched_count = 0
+        for chunk_id in self._select_candidates(query_tags):
+            chunk = self.chunks.get(chunk_id)
+            if not chunk:
+                continue
             if not chunk.matches_query(query_tags):
                 continue
+
+            matched_count += 1
+            if matched_count > self.early_exit_k:
+                break
             
             wf = self.calc_weight(chunk)
             if wf.final >= min_weight:
@@ -217,6 +379,8 @@ class MemoryLayerCore:
         
         chunk_a.associations[chunk_id_b] = min(1.0, current_a + strength * (1 - current_a))
         chunk_b.associations[chunk_id_a] = min(1.0, current_b + strength * (1 - current_b))
+        self._invalidate_weight(chunk_id_a)
+        self._invalidate_weight(chunk_id_b)
     
     def weaken_association(self, chunk_id_a: str, chunk_id_b: str, strength: float = 0.05):
         """Hebbian减弱：长期不一起使用则衰减"""
@@ -229,12 +393,15 @@ class MemoryLayerCore:
             chunk_a.associations[chunk_id_b] = max(0.0, chunk_a.associations[chunk_id_b] - strength)
         if chunk_id_a in chunk_b.associations:
             chunk_b.associations[chunk_id_a] = max(0.0, chunk_b.associations[chunk_id_a] - strength)
+        self._invalidate_weight(chunk_id_a)
+        self._invalidate_weight(chunk_id_b)
     
     def access_together(self, chunk_ids: List[str]):
         """同时访问多个记忆（触发Hebbian增强）"""
         for chunk_id in chunk_ids:
             if chunk_id in self.chunks:
                 self.chunks[chunk_id].access()
+                self._invalidate_weight(chunk_id)
         
         for i, id_a in enumerate(chunk_ids):
             for id_b in chunk_ids[i+1:]:
@@ -278,6 +445,7 @@ class MemoryLayerCore:
         # 如果持续成功，重要性缓慢上升
         if success:
             chunk.importance = min(1.0, chunk.importance + 0.01)
+        self._invalidate_weight(chunk_id)
     
     # ============ 降级检查 ============
     
@@ -301,9 +469,30 @@ class MemoryLayerCore:
         for chunk_id in chunk_ids:
             if chunk_id in self.chunks:
                 chunk = self.chunks.pop(chunk_id)
+                self._remove_from_index(chunk)
                 chunk.layer = MemoryLayer.FORGOTTEN
                 degraded.append(chunk)
         return degraded
+
+    def decay_all_unused(self, idle_seconds: float = 7 * 24 * 3600) -> int:
+        """
+        衰减长期未访问记忆的使用频率。
+
+        时间和近因衰减在 calc_weight 中动态计算；这里负责让访问频率也逐步回落，
+        这样 maintain() 可以安全运行并推动低价值记忆降级。
+        """
+        now = time.time()
+        changed = 0
+        for chunk in self.chunks.values():
+            if now - chunk.last_accessed <= idle_seconds:
+                continue
+            if chunk.access_count <= 0:
+                continue
+            chunk.access_count -= 1
+            chunk.updated_at = now
+            self._invalidate_weight(chunk.id)
+            changed += 1
+        return changed
     
     # ============ 持久化 ============
     
@@ -330,6 +519,7 @@ class MemoryLayerCore:
                 cid: MemoryChunk.from_dict(cdata) 
                 for cid, cdata in data.get("chunks", {}).items()
             }
+            self._rebuild_indexes()
             
             stats = data.get("stats", {})
             self.total_recall_success = stats.get("total_recall_success", 0)

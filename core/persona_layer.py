@@ -140,9 +140,11 @@ class PersonaLayer:
             pref.signal_history = pref.signal_history[-50:]
         
         # 更新兴趣度（指数移动平均）
+        # 信号分值表达的是相对中性的偏移量，先映射到 0~1 的目标兴趣度。
         old_score = pref.interest_score
+        signal_target = max(0.0, min(1.0, 0.5 + signal_value))
         pref.interest_score = (
-            old_score * 0.8 + signal_value * 0.2
+            old_score * 0.8 + signal_target * 0.2
         )
         pref.interest_score = max(0.0, min(1.0, pref.interest_score))
         
