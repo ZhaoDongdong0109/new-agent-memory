@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "new-agent-memory"
+version = "0.1.0"
+description = "Explainable human-like memory layer for AI agents."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "AGPL-3.0-or-later" }
+authors = [
+  { name = "ZhaoDongdong0109" }
+]
+keywords = [
+  "ai",
+  "agents",
+  "agent-memory",
+  "long-term-memory",
+  "memory-management",
+  "llm",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/ZhaoDongdong0109/new-agent-memory"
+Repository = "https://github.com/ZhaoDongdong0109/new-agent-memory"
+Issues = "https://github.com/ZhaoDongdong0109/new-agent-memory/issues"
+
+[tool.setuptools]
+py-modules = [
+  "forgotten_layer",
+  "main",
+  "memory_chunk",
+  "memory_layer_core",
+  "retrieval",
+]
+packages = ["core", "new_agent_memory"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
