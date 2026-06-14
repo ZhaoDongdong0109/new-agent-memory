@@ -1,0 +1,417 @@
+"""A minimal embodied agent loop built on memory and attention.
+
+The loop is intentionally small and inspectable:
+
+Observe -> Focus -> Decide -> Act -> Evaluate -> Remember -> Consolidate
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+import time
+import uuid
+
+from core.attention_system import FocusWorkspace
+from core.weight_system import MemoryType
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+@dataclass
+class Observation:
+    """What the agent can perceive from its environment."""
+
+    content: str
+    source: str = "user"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=_now)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "content": self.content,
+            "source": self.source,
+            "metadata": self.metadata,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Observation":
+        return cls(
+            content=data.get("content", ""),
+            source=data.get("source", "user"),
+            metadata=dict(data.get("metadata", {})),
+            timestamp=float(data.get("timestamp", _now())),
+        )
+
+
+@dataclass
+class AgentAction:
+    """An action selected by the agent."""
+
+    name: str
+    arguments: Dict[str, Any] = field(default_factory=dict)
+    rationale: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "arguments": self.arguments,
+            "rationale": self.rationale,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AgentAction":
+        return cls(
+            name=data.get("name", "respond"),
+            arguments=dict(data.get("arguments", {})),
+            rationale=data.get("rationale", ""),
+        )
+
+
+@dataclass
+class ActionResult:
+    """The consequence of an action."""
+
+    success: bool
+    output: str = ""
+    cost: float = 0.0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "output": self.output,
+            "cost": self.cost,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ActionResult":
+        return cls(
+            success=bool(data.get("success", False)),
+            output=data.get("output", ""),
+            cost=float(data.get("cost", 0.0)),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass
+class ExperienceEpisode:
+    """A full action loop that can become future memory."""
+
+    goal: str
+    observation: Observation
+    action: AgentAction
+    result: ActionResult
+    reward: float
+    lesson: str = ""
+    next_policy: str = ""
+    focus_context: str = ""
+    id: str = field(default_factory=lambda: f"exp_{uuid.uuid4().hex[:10]}")
+    created_at: float = field(default_factory=_now)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "goal": self.goal,
+            "observation": self.observation.to_dict(),
+            "action": self.action.to_dict(),
+            "result": self.result.to_dict(),
+            "reward": self.reward,
+            "lesson": self.lesson,
+            "next_policy": self.next_policy,
+            "focus_context": self.focus_context,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ExperienceEpisode":
+        return cls(
+            id=data.get("id", f"exp_{uuid.uuid4().hex[:10]}"),
+            goal=data.get("goal", ""),
+            observation=Observation.from_dict(data.get("observation", {})),
+            action=AgentAction.from_dict(data.get("action", {})),
+            result=ActionResult.from_dict(data.get("result", {})),
+            reward=float(data.get("reward", 0.0)),
+            lesson=data.get("lesson", ""),
+            next_policy=data.get("next_policy", ""),
+            focus_context=data.get("focus_context", ""),
+            created_at=float(data.get("created_at", _now())),
+        )
+
+    def to_memory_text(self) -> str:
+        return (
+            f"Goal: {self.goal}\n"
+            f"Observation: {self.observation.content}\n"
+            f"Action: {self.action.name} {self.action.arguments}\n"
+            f"Result: {'success' if self.result.success else 'failure'} - {self.result.output}\n"
+            f"Lesson: {self.lesson}\n"
+            f"Next policy: {self.next_policy}"
+        )
+
+
+class ExperienceLayer:
+    """Stores embodied episodes and consolidates them into memory."""
+
+    def __init__(self, episodes: Optional[List[ExperienceEpisode]] = None):
+        self.episodes = episodes or []
+
+    def add(self, episode: ExperienceEpisode) -> str:
+        self.episodes.append(episode)
+        return episode.id
+
+    def recent(self, limit: int = 10) -> List[ExperienceEpisode]:
+        return self.episodes[-limit:]
+
+    def consolidate(self, memory_system: Any, limit: int = 5) -> List[str]:
+        """
+        Turn recent high-signal episodes into durable memory and procedures.
+
+        The memory_system is duck-typed so this layer stays independent from main.py.
+        """
+        created: List[str] = []
+        for episode in self.recent(limit):
+            if episode.reward < 0.35 and not episode.lesson:
+                continue
+
+            memory_id = memory_system.add_memory(
+                content=episode.to_memory_text(),
+                memory_type=MemoryType.STORY,
+                topics=["experience", "agent", episode.action.name],
+                importance=_clamp(0.35 + episode.reward * 0.45),
+                metadata={"experience_id": episode.id, "kind": "episode"},
+            )
+            created.append(memory_id)
+
+            if episode.result.success and episode.next_policy:
+                procedure = memory_system.add_procedure(
+                    title=f"Learned policy: {episode.action.name}",
+                    steps=[episode.next_policy],
+                    triggers=[episode.action.name, "experience", "success"],
+                    importance=_clamp(0.45 + episode.reward * 0.4),
+                    confidence=_clamp(0.45 + episode.reward * 0.4),
+                )
+                created.append(procedure.id)
+
+        return created
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"episodes": [episode.to_dict() for episode in self.episodes]}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ExperienceLayer":
+        return cls([ExperienceEpisode.from_dict(item) for item in data.get("episodes", [])])
+
+
+ToolHandler = Callable[[Dict[str, Any]], ActionResult]
+
+
+@dataclass
+class AgentTool:
+    """A callable digital body part."""
+
+    name: str
+    description: str
+    handler: ToolHandler
+    cost: float = 0.0
+
+    def run(self, arguments: Dict[str, Any]) -> ActionResult:
+        result = self.handler(arguments)
+        result.cost += self.cost
+        return result
+
+
+class ToolRegistry:
+    """Registry of actions the agent is allowed to take."""
+
+    def __init__(self):
+        self.tools: Dict[str, AgentTool] = {}
+
+    def register(self, tool: AgentTool):
+        self.tools[tool.name] = tool
+
+    def run(self, action: AgentAction) -> ActionResult:
+        tool = self.tools.get(action.name)
+        if not tool:
+            return ActionResult(False, f"Unknown tool: {action.name}", metadata={"missing_tool": action.name})
+        try:
+            return tool.run(action.arguments)
+        except Exception as exc:
+            return ActionResult(False, f"{type(exc).__name__}: {exc}")
+
+    def describe(self) -> List[Dict[str, Any]]:
+        return [
+            {"name": tool.name, "description": tool.description, "cost": tool.cost}
+            for tool in self.tools.values()
+        ]
+
+
+Planner = Callable[[Observation, FocusWorkspace, ToolRegistry], AgentAction]
+Evaluator = Callable[[Observation, AgentAction, ActionResult], float]
+
+
+def default_planner(observation: Observation, workspace: FocusWorkspace, tools: ToolRegistry) -> AgentAction:
+    """A safe planner that responds unless a tool trigger is obvious."""
+    lower = observation.content.lower()
+    for tool_name in tools.tools:
+        if tool_name.lower() in lower:
+            return AgentAction(
+                name=tool_name,
+                arguments={"input": observation.content, "workspace": workspace.to_prompt_context()},
+                rationale=f"Observation mentioned tool '{tool_name}'.",
+            )
+
+    return AgentAction(
+        name="respond",
+        arguments={
+            "message": observation.content,
+            "context": workspace.to_prompt_context(),
+        },
+        rationale="No explicit tool trigger; produce a contextual response.",
+    )
+
+
+def default_evaluator(observation: Observation, action: AgentAction, result: ActionResult) -> float:
+    """Reward successful low-cost actions, penalize failures."""
+    if not result.success:
+        return 0.0
+    cost_penalty = min(0.3, result.cost)
+    return _clamp(0.7 - cost_penalty)
+
+
+class CognitiveAgent:
+    """A first digital body for memory-driven agents."""
+
+    def __init__(
+        self,
+        memory_system: Any,
+        name: str = "cognitive-agent",
+        planner: Planner = default_planner,
+        evaluator: Evaluator = default_evaluator,
+        experience_layer: Optional[ExperienceLayer] = None,
+        auto_consolidate: bool = True,
+    ):
+        self.memory = memory_system
+        self.name = name
+        self.planner = planner
+        self.evaluator = evaluator
+        self.experience = experience_layer or ExperienceLayer()
+        self.tools = ToolRegistry()
+        self.auto_consolidate = auto_consolidate
+        self._register_default_tools()
+
+    def observe(self, content: str, source: str = "user", metadata: Optional[Dict[str, Any]] = None) -> Observation:
+        return Observation(content=content, source=source, metadata=metadata or {})
+
+    def run_turn(
+        self,
+        observation: Union[Observation, str],
+        consolidate: Optional[bool] = None,
+    ) -> ExperienceEpisode:
+        if isinstance(observation, str):
+            observation = self.observe(observation)
+
+        workspace = self.memory.focus(observation.content, include_forgotten=True)
+        action = self.planner(observation, workspace, self.tools)
+        result = self.tools.run(action)
+        reward = self.evaluator(observation, action, result)
+        lesson = self._derive_lesson(observation, action, result, reward)
+        next_policy = self._derive_next_policy(action, result, reward)
+
+        active_goal = workspace.active_goal.objective if workspace.active_goal else ""
+        episode = ExperienceEpisode(
+            goal=active_goal,
+            observation=observation,
+            action=action,
+            result=result,
+            reward=reward,
+            lesson=lesson,
+            next_policy=next_policy,
+            focus_context=workspace.to_prompt_context(),
+        )
+        self.experience.add(episode)
+
+        should_consolidate = self.auto_consolidate if consolidate is None else consolidate
+        if should_consolidate:
+            self.experience.consolidate(self.memory, limit=1)
+
+        return episode
+
+    def add_tool(self, name: str, description: str, handler: ToolHandler, cost: float = 0.0):
+        self.tools.register(AgentTool(name=name, description=description, handler=handler, cost=cost))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "auto_consolidate": self.auto_consolidate,
+            "experience": self.experience.to_dict(),
+            "tools": self.tools.describe(),
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+        memory_system: Any,
+        planner: Planner = default_planner,
+        evaluator: Evaluator = default_evaluator,
+    ) -> "CognitiveAgent":
+        return cls(
+            memory_system=memory_system,
+            name=data.get("name", "cognitive-agent"),
+            planner=planner,
+            evaluator=evaluator,
+            experience_layer=ExperienceLayer.from_dict(data.get("experience", {})),
+            auto_consolidate=bool(data.get("auto_consolidate", True)),
+        )
+
+    def _register_default_tools(self):
+        self.add_tool("respond", "Return a context-aware text response.", self._respond_tool)
+        self.add_tool("remember", "Store an explicit memory from the observation.", self._remember_tool)
+
+    def _respond_tool(self, arguments: Dict[str, Any]) -> ActionResult:
+        message = arguments.get("message") or arguments.get("input", "")
+        context = arguments.get("context") or arguments.get("workspace", "")
+        if context:
+            output = f"{context}\n\nResponse seed: {message}"
+        else:
+            output = f"Response seed: {message}"
+        return ActionResult(True, output)
+
+    def _remember_tool(self, arguments: Dict[str, Any]) -> ActionResult:
+        content = arguments.get("content") or arguments.get("input", "")
+        if not content:
+            return ActionResult(False, "No content to remember.")
+        memory_id = self.memory.add_memory(
+            content=content,
+            memory_type=MemoryType.INTERACTION,
+            topics=["explicit", "agent"],
+            importance=0.55,
+            metadata={"source": self.name, "tool": "remember"},
+        )
+        return ActionResult(True, f"Stored memory {memory_id}", metadata={"memory_id": memory_id})
+
+    def _derive_lesson(
+        self,
+        observation: Observation,
+        action: AgentAction,
+        result: ActionResult,
+        reward: float,
+    ) -> str:
+        if result.success:
+            return f"When seeing '{observation.source}' input like this, action '{action.name}' worked."
+        return f"Action '{action.name}' failed: {result.output}"
+
+    def _derive_next_policy(self, action: AgentAction, result: ActionResult, reward: float) -> str:
+        if result.success and reward >= 0.5:
+            return f"Use '{action.name}' again when the focus workspace and observation match this pattern."
+        if not result.success:
+            return f"Before using '{action.name}' again, check tool availability and arguments."
+        return ""

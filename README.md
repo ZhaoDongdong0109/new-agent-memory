@@ -27,6 +27,8 @@ Explainable human-like memory layer for AI agents.
 - **程序记忆**：保存可复用的做事方式，例如测试、提交、发布、排查问题的流程。
 - **注意力工作区**：按目标相关度、查询相关度、重要性、近因、频率和干扰惩罚选择上下文。
 - **审计轨迹**：每次进入工作区的记忆和程序都会带有分数拆解，便于解释为什么被选中。
+- **CognitiveAgent**：提供 `Observe -> Focus -> Act -> Evaluate -> Remember -> Consolidate` 的最小数字身体闭环。
+- **经验层**：把行动、结果、奖励、教训和下一次策略记录为经验 episode，并可巩固成记忆/程序。
 - **可持久化**：核心层、伪遗忘层、人格偏好和注意力状态可以保存到 JSON。
 - **轻量高性能检索**：核心层内置倒排索引、短期权重缓存、候选集限制和早期退出。
 
@@ -109,6 +111,55 @@ print(workspace.to_prompt_context())
 
 输出会包含当前目标、应该带入上下文的程序记忆、以及真正相关的记忆。无关但重要的偏好会被审计记录下来，但不会自动进入工作区。
 
+## Cognitive Agent Loop
+
+`CognitiveAgent` 是这个项目迈向通用 Agent 的第一具“数字身体”。它不假装已经拥有物理感受，但它能在一个可观察、可行动、有反馈、可累积后果的环境里运行。
+
+```python
+from new_agent_memory import ActionResult, AgentAction, HumanLikeMemorySystem
+
+memory = HumanLikeMemorySystem()
+memory.start_goal(
+    "帮助用户把项目推进到可运行的 Agent 原型",
+    constraints=["先观察", "再行动", "最后复盘"],
+)
+
+agent = memory.create_agent(name="hermes-seed")
+
+def planner(observation, workspace, tools):
+    return AgentAction(
+        name="inspect",
+        arguments={
+            "input": observation.content,
+            "focus": workspace.to_prompt_context(),
+        },
+        rationale="用户要求检查，因此调用 inspect 工具。",
+    )
+
+def inspect_tool(arguments):
+    return ActionResult(
+        success=True,
+        output="检查完成。当前注意力上下文长度：" + str(len(arguments.get("focus", ""))),
+        cost=0.05,
+    )
+
+agent.planner = planner
+agent.add_tool("inspect", "Inspect the current focus workspace.", inspect_tool)
+
+episode = agent.run_turn("请检查当前 Agent 闭环是否能工作")
+print(episode.lesson)
+print(episode.next_policy)
+```
+
+每一轮会产生一个 `ExperienceEpisode`：
+
+```text
+Observation -> FocusWorkspace -> AgentAction -> ActionResult -> reward
+  -> lesson -> next_policy -> memory/procedure consolidation
+```
+
+这让系统开始记录“我做了什么、结果如何、下次该怎么做”，而不只是保存对话文本。
+
 ## Examples
 
 ```bash
@@ -116,6 +167,7 @@ python examples/simple_memory.py
 python examples/forgotten_recall.py
 python examples/persona_adaptation.py
 python examples/attention_workspace.py
+python examples/cognitive_agent.py
 ```
 
 示例覆盖：
@@ -124,6 +176,7 @@ python examples/attention_workspace.py
 - 伪遗忘层被线索唤醒
 - 用户反馈改变主动回忆偏好
 - 目标驱动的注意力工作区
+- 数字身体闭环和经验巩固
 
 ## Architecture
 
@@ -131,7 +184,7 @@ python examples/attention_workspace.py
 用户输入
   |
   v
-目标栈 + 意图/线索解析
+目标栈 + 观察输入
   |
   v
 注意力门控 --选择--> 工作区上下文
@@ -141,10 +194,10 @@ python examples/attention_workspace.py
   +--> 必要时唤醒伪遗忘层
   |
   v
-组装与审阅 --> 输出
+Agent 决策 -> 工具行动 -> 结果评价
   |
   v
-反馈更新：人格偏好 / 程序置信度 / 记忆权重
+经验记录与巩固：记忆 / 程序 / 偏好 / 目标
 ```
 
 模块结构：
@@ -157,6 +210,7 @@ new-agent-memory/
 ├── forgotten_layer.py         # 伪遗忘层与线索唤醒
 ├── retrieval.py               # 查询解析、检索、组装、审阅
 ├── core/
+│   ├── agent_system.py        # CognitiveAgent、工具、经验层与行动闭环
 │   ├── attention_system.py    # GoalStack、程序记忆、注意力评分与工作区
 │   ├── weight_system.py       # 自适应权重系统实验
 │   ├── emotion_engine.py      # 情绪推断与情绪系数采样
@@ -235,6 +289,8 @@ python -m compileall .
 - 人格正反馈提升兴趣度
 - 目标驱动注意力门控
 - 注意力状态持久化
+- CognitiveAgent 行动闭环
+- 经验 episode 巩固为长期记忆和程序记忆
 
 ## Roadmap
 
@@ -243,7 +299,11 @@ python -m compileall .
 - [x] 基础测试与 GitHub Actions
 - [x] 可运行 examples
 - [x] GoalStack、程序记忆和注意力工作区
+- [x] CognitiveAgent 数字身体闭环
 - [ ] CLI：`memory add/search/stats`
+- [ ] Hermes / OpenAI-compatible Agent adapter
+- [ ] 自动记忆提取器 `MemoryExtractor`
+- [ ] 经验复盘与矛盾处理 `ConsolidationEngine`
 - [ ] SQLite 持久化后端
 - [ ] 更强的自然语言线索解析
 - [ ] LLM 驱动的碎片组装与审阅

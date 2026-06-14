@@ -14,6 +14,7 @@ from retrieval import MemoryRetrieval, QueryContext, ReconstructionResult, Revie
 from core.weight_system import MemoryType
 from core.persona_layer import PersonaLayer, BehaviorType
 from core.attention_system import AttentionOS, FocusWorkspace, Goal, ProcedureMemory
+from core.agent_system import CognitiveAgent
 
 
 class HumanLikeMemorySystem:
@@ -381,6 +382,20 @@ class HumanLikeMemorySystem:
             "procedures": [procedure.to_dict() for procedure in self.attention.procedures],
             "workspace_history_count": len(self.attention.workspace_history),
         }
+
+    # ============ Agent 运行时 ============
+
+    def create_agent(
+        self,
+        name: str = "cognitive-agent",
+        auto_consolidate: bool = True,
+    ) -> CognitiveAgent:
+        """创建一个使用本记忆系统作为认知层的 Agent 运行时"""
+        return CognitiveAgent(
+            memory_system=self,
+            name=name,
+            auto_consolidate=auto_consolidate,
+        )
     
     # ============ 维护 ============
     
