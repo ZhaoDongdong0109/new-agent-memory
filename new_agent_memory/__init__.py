@@ -12,6 +12,7 @@ from core.agent_system import (
     ExperienceLayer,
     Observation,
 )
+from core.llm_planner import LLMCallable, LLMPlanner, LLMPlannerConfig
 from core.weight_system import MemoryType
 
 __version__ = "0.1.0"
@@ -26,6 +27,9 @@ __all__ = [
     "ExperienceLayer",
     "FocusWorkspace",
     "Goal",
+    "LLMCallable",
+    "LLMPlanner",
+    "LLMPlannerConfig",
     "MemoryChunk",
     "MemoryLayer",
     "MemoryType",

@@ -28,6 +28,7 @@ Explainable human-like memory layer for AI agents.
 - **注意力工作区**：按目标相关度、查询相关度、重要性、近因、频率和干扰惩罚选择上下文。
 - **审计轨迹**：每次进入工作区的记忆和程序都会带有分数拆解，便于解释为什么被选中。
 - **CognitiveAgent**：提供 `Observe -> Focus -> Act -> Evaluate -> Remember -> Consolidate` 的最小数字身体闭环。
+- **LLMPlanner**：把 OpenAI、Hermes 或本地模型接成 Agent 的决策核心，让模型根据目标、记忆和工具返回下一步行动。
 - **经验层**：把行动、结果、奖励、教训和下一次策略记录为经验 episode，并可巩固成记忆/程序。
 - **可持久化**：核心层、伪遗忘层、人格偏好和注意力状态可以保存到 JSON。
 - **轻量高性能检索**：核心层内置倒排索引、短期权重缓存、候选集限制和早期退出。
@@ -160,6 +161,57 @@ Observation -> FocusWorkspace -> AgentAction -> ActionResult -> reward
 
 这让系统开始记录“我做了什么、结果如何、下次该怎么做”，而不只是保存对话文本。
 
+## LLM Planner
+
+`new-agent-memory` 本身是认知层，不是大模型。要让 Agent 做复杂推理，需要给 `CognitiveAgent` 接一个 LLM planner。
+
+最小形式是传入一个 `prompt -> text` 的函数：
+
+```python
+from new_agent_memory import CognitiveAgent, HumanLikeMemorySystem, LLMPlanner
+
+memory = HumanLikeMemorySystem()
+agent = CognitiveAgent(memory_system=memory)
+
+def call_hermes_or_local_model(prompt: str) -> str:
+    # 返回必须包含一个 JSON action
+    return """
+{
+  "name": "respond",
+  "arguments": {"message": "我会根据当前目标和记忆回答。"},
+  "rationale": "No external tool is needed."
+}
+"""
+
+agent.planner = LLMPlanner(call_hermes_or_local_model)
+episode = agent.run_turn("下一步怎么做？")
+```
+
+如果使用 OpenAI Responses 风格客户端，可以这样包一层：
+
+```python
+from openai import OpenAI
+from new_agent_memory import LLMPlanner
+
+client = OpenAI()
+planner = LLMPlanner.from_openai_responses(
+    client=client,
+    model="gpt-4.1-mini",
+)
+```
+
+模型需要返回的 JSON：
+
+```json
+{
+  "name": "tool_name",
+  "arguments": {},
+  "rationale": "short reason"
+}
+```
+
+`name` 必须是当前 Agent 已注册工具之一，例如 `respond`、`remember` 或你自己用 `agent.add_tool(...)` 添加的工具。
+
 ## Examples
 
 ```bash
@@ -168,6 +220,7 @@ python examples/forgotten_recall.py
 python examples/persona_adaptation.py
 python examples/attention_workspace.py
 python examples/cognitive_agent.py
+python examples/llm_planner.py
 ```
 
 示例覆盖：
@@ -177,6 +230,7 @@ python examples/cognitive_agent.py
 - 用户反馈改变主动回忆偏好
 - 目标驱动的注意力工作区
 - 数字身体闭环和经验巩固
+- LLM 决策器如何选择工具行动
 
 ## Architecture
 
@@ -211,6 +265,7 @@ new-agent-memory/
 ├── retrieval.py               # 查询解析、检索、组装、审阅
 ├── core/
 │   ├── agent_system.py        # CognitiveAgent、工具、经验层与行动闭环
+│   ├── llm_planner.py         # 模型无关 LLMPlanner 和 OpenAI Responses 包装
 │   ├── attention_system.py    # GoalStack、程序记忆、注意力评分与工作区
 │   ├── weight_system.py       # 自适应权重系统实验
 │   ├── emotion_engine.py      # 情绪推断与情绪系数采样
@@ -291,6 +346,7 @@ python -m compileall .
 - 注意力状态持久化
 - CognitiveAgent 行动闭环
 - 经验 episode 巩固为长期记忆和程序记忆
+- LLMPlanner JSON 行动解析、fallback 和工具选择
 
 ## Roadmap
 
@@ -300,6 +356,7 @@ python -m compileall .
 - [x] 可运行 examples
 - [x] GoalStack、程序记忆和注意力工作区
 - [x] CognitiveAgent 数字身体闭环
+- [x] 模型无关 LLMPlanner
 - [ ] CLI：`memory add/search/stats`
 - [ ] Hermes / OpenAI-compatible Agent adapter
 - [ ] 自动记忆提取器 `MemoryExtractor`
