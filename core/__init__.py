@@ -1,16 +1,8 @@
-"""Core components for new-agent-memory."""
+"""Internal core modules for new-agent-memory.
 
-from core.emotion_engine import EmotionEngine, EmotionResult
-from core.persona_layer import BehaviorType, PersonaLayer
-from core.weight_system import AdaptiveWeightSystem, MemoryItem, MemoryType, WeightResult
+Public imports are exposed from `new_agent_memory`.
+Keeping this package initializer lightweight avoids circular imports between
+memory chunks, attention, and agent runtime modules.
+"""
 
-__all__ = [
-    "AdaptiveWeightSystem",
-    "BehaviorType",
-    "EmotionEngine",
-    "EmotionResult",
-    "MemoryItem",
-    "MemoryType",
-    "PersonaLayer",
-    "WeightResult",
-]
+__all__: list[str] = []
