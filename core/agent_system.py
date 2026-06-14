@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+import json
 import time
 import uuid
 
@@ -318,9 +319,22 @@ class CognitiveAgent:
         if isinstance(observation, str):
             observation = self.observe(observation)
 
+        if hasattr(self.memory, "observe_world"):
+            self.memory.observe_world(observation)
+
         workspace = self.memory.focus(observation.content, include_forgotten=True)
+        if hasattr(self.memory, "attach_cognitive_context"):
+            self.memory.attach_cognitive_context(workspace, tools=self.tools)
+
         action = self.planner(observation, workspace, self.tools)
+        prediction = None
+        if hasattr(self.memory, "predict_action"):
+            prediction = self.memory.predict_action(action, tools=self.tools)
+
         result = self.tools.run(action)
+        if prediction is not None:
+            result.metadata.setdefault("prediction", prediction.to_dict())
+
         reward = self.evaluator(observation, action, result)
         lesson = self._derive_lesson(observation, action, result, reward)
         next_policy = self._derive_next_policy(action, result, reward)
@@ -337,6 +351,9 @@ class CognitiveAgent:
             focus_context=workspace.to_prompt_context(),
         )
         self.experience.add(episode)
+
+        if hasattr(self.memory, "reflect_episode"):
+            self.memory.reflect_episode(episode)
 
         should_consolidate = self.auto_consolidate if consolidate is None else consolidate
         if should_consolidate:
@@ -375,6 +392,7 @@ class CognitiveAgent:
     def _register_default_tools(self):
         self.add_tool("respond", "Return a context-aware text response.", self._respond_tool)
         self.add_tool("remember", "Store an explicit memory from the observation.", self._remember_tool)
+        self.add_tool("introspect", "Read current self-model, drives, world beliefs, and open questions.", self._introspect_tool)
 
     def _respond_tool(self, arguments: Dict[str, Any]) -> ActionResult:
         message = arguments.get("message") or arguments.get("input", "")
@@ -397,6 +415,13 @@ class CognitiveAgent:
             metadata={"source": self.name, "tool": "remember"},
         )
         return ActionResult(True, f"Stored memory {memory_id}", metadata={"memory_id": memory_id})
+
+    def _introspect_tool(self, arguments: Dict[str, Any]) -> ActionResult:
+        if not hasattr(self.memory, "get_cognitive_summary"):
+            return ActionResult(False, "This memory system has no cognitive state.")
+        summary = self.memory.get_cognitive_summary()
+        output = json.dumps(summary, ensure_ascii=False, indent=2)
+        return ActionResult(True, output, metadata={"kind": "cognitive_summary"})
 
     def _derive_lesson(
         self,
