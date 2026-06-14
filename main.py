@@ -5,6 +5,7 @@
 """
 
 from typing import Dict, List, Optional, Any
+import json
 import time
 
 from memory_chunk import MemoryChunk, MemoryLayer
@@ -15,6 +16,7 @@ from core.weight_system import MemoryType
 from core.persona_layer import PersonaLayer, BehaviorType
 from core.attention_system import AttentionOS, FocusWorkspace, Goal, ProcedureMemory
 from core.agent_system import CognitiveAgent
+from core.cognitive_state import ActionExpectation, CognitiveFrame, CognitiveState, ReflectionNote
 
 
 class HumanLikeMemorySystem:
@@ -74,12 +76,13 @@ class HumanLikeMemorySystem:
             forgotten_layer=self.forgotten,
             review_confidence_threshold=retrieval_confidence_threshold,
         )
-        
+
         # 人格适应层
         self.persona = PersonaLayer()
 
         # 目标驱动注意力调度层
         self.attention = AttentionOS()
+        self.cognitive_state = CognitiveState()
         
         # 定时任务
         self.last_maintenance = time.time()
@@ -286,6 +289,7 @@ class HumanLikeMemorySystem:
             self.persona.on_active_recall_continue()
         else:
             self.persona.on_active_recall_ignore()
+        self.cognitive_state.reinforce_from_feedback(accepted, corrected_content)
     
     def on_active_recall_explicit_positive(self):
         """用户对主动提及表示惊喜"""
@@ -366,12 +370,14 @@ class HumanLikeMemorySystem:
         chunks = list(self.core.chunks.values())
         if include_forgotten:
             chunks.extend(self.forgotten.chunks.values())
-        return self.attention.build_focus(
+        workspace = self.attention.build_focus(
             query=query,
             memories=chunks,
             memory_limit=memory_limit,
             procedure_limit=procedure_limit,
         )
+        self.attach_cognitive_context(workspace)
+        return workspace
 
     def get_attention_summary(self) -> Dict[str, Any]:
         """获取注意力调度层摘要"""
@@ -382,6 +388,48 @@ class HumanLikeMemorySystem:
             "procedures": [procedure.to_dict() for procedure in self.attention.procedures],
             "workspace_history_count": len(self.attention.workspace_history),
         }
+
+    # ============ Reflective cognition ============
+
+    def observe_world(self, observation: Any):
+        """Fold a new observation into the self/world model."""
+        self.cognitive_state.observe(observation)
+
+    def attach_cognitive_context(self, workspace: FocusWorkspace, tools: Optional[Any] = None) -> FocusWorkspace:
+        """Attach current self/world state to a focus workspace."""
+        frame = self.cognitive_state.build_frame(
+            query=workspace.query,
+            workspace=workspace,
+            tools=tools,
+        )
+        context = frame.to_dict()
+        workspace.cognitive_context = context
+        if self.attention.workspace_history:
+            latest = self.attention.workspace_history[-1]
+            if latest.get("query") == workspace.query and latest.get("created_at") == workspace.created_at:
+                latest["cognitive_context"] = context
+        return workspace
+
+    def build_cognitive_frame(
+        self,
+        query: str = "",
+        workspace: Optional[FocusWorkspace] = None,
+        tools: Optional[Any] = None,
+    ) -> CognitiveFrame:
+        """Build an inspectable cognitive frame for prompts or debugging."""
+        return self.cognitive_state.build_frame(query=query, workspace=workspace, tools=tools)
+
+    def predict_action(self, action: Any, tools: Optional[Any] = None) -> ActionExpectation:
+        """Predict the likely outcome of an action before executing it."""
+        return self.cognitive_state.predict_action(action, tools=tools)
+
+    def reflect_episode(self, episode: Any) -> ReflectionNote:
+        """Update self/world state from a completed agent episode."""
+        return self.cognitive_state.reflect_episode(episode)
+
+    def get_cognitive_summary(self) -> Dict[str, Any]:
+        """Return current self-model, drives, world beliefs, and reflections."""
+        return self.cognitive_state.get_summary()
 
     # ============ Agent 运行时 ============
 
@@ -449,6 +497,10 @@ class HumanLikeMemorySystem:
         attention_path = f"{self.data_dir}/attention.json"
         with open(attention_path, 'w', encoding='utf-8') as f:
             json.dump(self.attention.to_dict(), f, ensure_ascii=False, indent=2)
+
+        cognitive_path = f"{self.data_dir}/cognitive_state.json"
+        with open(cognitive_path, 'w', encoding='utf-8') as f:
+            json.dump(self.cognitive_state.to_dict(), f, ensure_ascii=False, indent=2)
     
     def load(self) -> bool:
         """加载数据"""
@@ -459,6 +511,7 @@ class HumanLikeMemorySystem:
         forgotten_path = f"{self.data_dir}/forgotten.json"
         persona_path = f"{self.data_dir}/persona.json"
         attention_path = f"{self.data_dir}/attention.json"
+        cognitive_path = f"{self.data_dir}/cognitive_state.json"
         
         core_loaded = self.core.load(core_path) if os.path.exists(core_path) else False
         forgotten_loaded = self.forgotten.load(forgotten_path) if os.path.exists(forgotten_path) else False
@@ -484,8 +537,18 @@ class HumanLikeMemorySystem:
                 attention_loaded = True
             except Exception:
                 pass
+
+        cognitive_loaded = False
+        if os.path.exists(cognitive_path):
+            try:
+                with open(cognitive_path, 'r', encoding='utf-8') as f:
+                    cognitive_data = json.load(f)
+                self.cognitive_state = CognitiveState.from_dict(cognitive_data)
+                cognitive_loaded = True
+            except Exception:
+                pass
         
-        return core_loaded or forgotten_loaded or persona_loaded or attention_loaded
+        return core_loaded or forgotten_loaded or persona_loaded or attention_loaded or cognitive_loaded
     
     # ============ 统计 ============
     
@@ -505,6 +568,7 @@ class HumanLikeMemorySystem:
             "retrieval_stats": self.retrieval.get_stats(),
             "persona_summary": self.persona.get_profile_summary(),
             "attention_summary": self.get_attention_summary(),
+            "cognitive_summary": self.get_cognitive_summary(),
         }
     
     def get_recent_memories(self, limit: int = 10) -> List[Dict]:

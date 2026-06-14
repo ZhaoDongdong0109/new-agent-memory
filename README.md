@@ -29,6 +29,7 @@ Explainable human-like memory layer for AI agents.
 - **审计轨迹**：每次进入工作区的记忆和程序都会带有分数拆解，便于解释为什么被选中。
 - **CognitiveAgent**：提供 `Observe -> Focus -> Act -> Evaluate -> Remember -> Consolidate` 的最小数字身体闭环。
 - **LLMPlanner**：把 OpenAI、Hermes 或本地模型接成 Agent 的决策核心，让模型根据目标、记忆和工具返回下一步行动。
+- **CognitiveState**：维护自我模型、世界信念、驱动力、行动预期和反思记录，让 Agent 知道“我是谁、我能做什么、我不确定什么”。
 - **经验层**：把行动、结果、奖励、教训和下一次策略记录为经验 episode，并可巩固成记忆/程序。
 - **可持久化**：核心层、伪遗忘层、人格偏好和注意力状态可以保存到 JSON。
 - **轻量高性能检索**：核心层内置倒排索引、短期权重缓存、候选集限制和早期退出。
@@ -212,6 +213,37 @@ planner = LLMPlanner.from_openai_responses(
 
 `name` 必须是当前 Agent 已注册工具之一，例如 `respond`、`remember` 或你自己用 `agent.add_tool(...)` 添加的工具。
 
+## Reflective Cognition
+
+`CognitiveState` 是这次新增的“内在状态”层。它不负责替代 LLM 推理，而是给推理核心提供一个稳定、可保存、可审计的自我/世界模型：
+
+- **Self model**：身份、使命、能力边界和限制。
+- **Drive state**：连贯性、胜任感、好奇心、有用性、安全性等 homeostatic drives。
+- **World beliefs**：从观察、反馈和行动结果中形成带置信度的信念。
+- **Action priors**：根据工具历史结果预测某个行动的成功率和成本。
+- **Reflection notes**：每次行动后记录 outcome、insight、uncertainty 和 next question。
+
+完整 Agent loop 现在会变成：
+
+```text
+Observe -> update world model -> Focus -> attach CognitiveState
+  -> Predict -> Act -> Evaluate -> Reflect -> Remember -> Consolidate
+```
+
+默认工具里新增了 `introspect`：
+
+```python
+from new_agent_memory import CognitiveAgent, HumanLikeMemorySystem
+
+memory = HumanLikeMemorySystem()
+agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+
+episode = agent.run_turn("please introspect current state")
+print(episode.result.output)
+```
+
+这让 Agent 可以主动读取自己的驱动力、开放问题、工具先验和最近反思。`focus()` 也会把 `CognitiveState` 注入 `FocusWorkspace.to_prompt_context()`，所以 `LLMPlanner` 会自然看到这层上下文。
+
 ## Examples
 
 ```bash
@@ -221,6 +253,7 @@ python examples/persona_adaptation.py
 python examples/attention_workspace.py
 python examples/cognitive_agent.py
 python examples/llm_planner.py
+python examples/reflective_cognition.py
 ```
 
 示例覆盖：
@@ -231,6 +264,7 @@ python examples/llm_planner.py
 - 目标驱动的注意力工作区
 - 数字身体闭环和经验巩固
 - LLM 决策器如何选择工具行动
+- 自我/世界模型、反思记录和 `introspect` 工具
 
 ## Architecture
 
@@ -266,6 +300,7 @@ new-agent-memory/
 ├── core/
 │   ├── agent_system.py        # CognitiveAgent、工具、经验层与行动闭环
 │   ├── llm_planner.py         # 模型无关 LLMPlanner 和 OpenAI Responses 包装
+│   ├── cognitive_state.py     # 自我模型、世界信念、驱动力、行动预期与反思
 │   ├── attention_system.py    # GoalStack、程序记忆、注意力评分与工作区
 │   ├── weight_system.py       # 自适应权重系统实验
 │   ├── emotion_engine.py      # 情绪推断与情绪系数采样
@@ -347,6 +382,7 @@ python -m compileall .
 - CognitiveAgent 行动闭环
 - 经验 episode 巩固为长期记忆和程序记忆
 - LLMPlanner JSON 行动解析、fallback 和工具选择
+- CognitiveState 自我/世界模型、行动预期、反思和持久化
 
 ## Roadmap
 
@@ -357,6 +393,7 @@ python -m compileall .
 - [x] GoalStack、程序记忆和注意力工作区
 - [x] CognitiveAgent 数字身体闭环
 - [x] 模型无关 LLMPlanner
+- [x] CognitiveState 自我/世界模型与反思闭环
 - [ ] CLI：`memory add/search/stats`
 - [ ] Hermes / OpenAI-compatible Agent adapter
 - [ ] 自动记忆提取器 `MemoryExtractor`

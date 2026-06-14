@@ -253,6 +253,7 @@ class FocusWorkspace:
     memories: List[FocusItem]
     procedures: List[FocusItem]
     audit: List[Dict[str, Any]]
+    cognitive_context: Optional[Dict[str, Any]] = None
     created_at: float = field(default_factory=_now)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -262,6 +263,7 @@ class FocusWorkspace:
             "memories": [item.to_dict() for item in self.memories],
             "procedures": [item.to_dict() for item in self.procedures],
             "audit": self.audit,
+            "cognitive_context": self.cognitive_context,
             "created_at": self.created_at,
         }
 
@@ -279,7 +281,67 @@ class FocusWorkspace:
             lines.append("Memories:")
             for item in self.memories:
                 lines.append(f"- {item.content}")
+        if self.cognitive_context:
+            lines.extend(self._cognitive_context_lines())
         return "\n".join(lines)
+
+    def _cognitive_context_lines(self) -> List[str]:
+        context = self.cognitive_context or {}
+        lines = ["Cognitive State:"]
+        identity = context.get("identity")
+        if identity:
+            lines.append(f"- Identity: {identity}")
+
+        drives = context.get("drives") or []
+        if drives:
+            lines.append("- Drives:")
+            for drive in drives[:5]:
+                lines.append(
+                    "  - {name}: value={value:.2f}, urgency={urgency:.2f}, target={target:.2f}".format(
+                        name=drive.get("name", ""),
+                        value=float(drive.get("value", 0.0)),
+                        urgency=float(drive.get("urgency", 0.0)),
+                        target=float(drive.get("target", 0.0)),
+                    )
+                )
+
+        beliefs = context.get("beliefs") or []
+        if beliefs:
+            lines.append("- World beliefs:")
+            for belief in beliefs[:5]:
+                lines.append(
+                    "  - {subject} {predicate} {object} (confidence={confidence:.2f})".format(
+                        subject=belief.get("subject", ""),
+                        predicate=belief.get("predicate", ""),
+                        object=belief.get("object", ""),
+                        confidence=float(belief.get("confidence", 0.0)),
+                    )
+                )
+
+        expectations = context.get("action_expectations") or []
+        if expectations:
+            lines.append("- Action priors:")
+            for expectation in expectations[:5]:
+                lines.append(
+                    "  - {name}: success~{success:.2f}, cost~{cost:.2f}".format(
+                        name=expectation.get("action_name", ""),
+                        success=float(expectation.get("expected_success", 0.0)),
+                        cost=float(expectation.get("expected_cost", 0.0)),
+                    )
+                )
+
+        open_questions = context.get("open_questions") or []
+        if open_questions:
+            lines.append("- Open questions:")
+            for question in open_questions[:4]:
+                lines.append(f"  - {question}")
+
+        risk_flags = context.get("risk_flags") or []
+        if risk_flags:
+            lines.append("- Risk flags:")
+            for risk in risk_flags[:4]:
+                lines.append(f"  - {risk}")
+        return lines
 
 
 class AttentionScorer:

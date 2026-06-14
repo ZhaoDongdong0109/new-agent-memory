@@ -13,6 +13,15 @@ from core.agent_system import (
     Observation,
 )
 from core.llm_planner import LLMCallable, LLMPlanner, LLMPlannerConfig
+from core.cognitive_state import (
+    ActionExpectation,
+    CognitiveFrame,
+    CognitiveState,
+    DriveState,
+    ReflectionNote,
+    WorldBelief,
+    WorldEntity,
+)
 from core.weight_system import MemoryType
 
 __version__ = "0.1.0"
@@ -20,9 +29,13 @@ __version__ = "0.1.0"
 __all__ = [
     "HumanLikeMemorySystem",
     "ActionResult",
+    "ActionExpectation",
     "AgentAction",
     "AttentionOS",
+    "CognitiveFrame",
     "CognitiveAgent",
+    "CognitiveState",
+    "DriveState",
     "ExperienceEpisode",
     "ExperienceLayer",
     "FocusWorkspace",
@@ -35,7 +48,10 @@ __all__ = [
     "MemoryType",
     "Observation",
     "ProcedureMemory",
+    "ReflectionNote",
     "ReconstructionResult",
     "ReviewResult",
+    "WorldBelief",
+    "WorldEntity",
     "__version__",
 ]
