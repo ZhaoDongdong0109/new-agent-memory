@@ -465,6 +465,39 @@ class HumanLikeMemorySystem:
         if synthesize_tool_responses:
             agent.response_synthesizer = LLMResponseSynthesizer(planner.llm)
         return agent
+
+    def create_runtime(
+        self,
+        name: str = "cognitive-runtime-agent",
+        auto_consolidate: bool = True,
+        max_steps: int = 4,
+    ):
+        """Create a multi-step CognitiveRuntime with the default local planner."""
+        from core.cognitive_runtime import CognitiveRuntime, CognitiveRuntimeConfig
+
+        agent = self.create_agent(name=name, auto_consolidate=auto_consolidate)
+        return CognitiveRuntime(agent, config=CognitiveRuntimeConfig(max_steps=max_steps))
+
+    def create_openai_runtime(
+        self,
+        name: str = "openai-compatible-runtime-agent",
+        auto_consolidate: bool = True,
+        env_file: Optional[str] = ".env",
+        max_steps: int = 4,
+        **api_overrides: Any,
+    ):
+        """Create a multi-step CognitiveRuntime backed by an OpenAI-compatible API."""
+        from core.cognitive_runtime import CognitiveRuntime, CognitiveRuntimeConfig, LLMRuntimeFinalizer
+
+        agent = self.create_openai_agent(
+            name=name,
+            auto_consolidate=auto_consolidate,
+            env_file=env_file,
+            **api_overrides,
+        )
+        llm = getattr(agent.planner, "llm", None)
+        finalizer = LLMRuntimeFinalizer(llm) if llm is not None else None
+        return CognitiveRuntime(agent, config=CognitiveRuntimeConfig(max_steps=max_steps), finalizer=finalizer)
     
     # ============ 维护 ============
     
