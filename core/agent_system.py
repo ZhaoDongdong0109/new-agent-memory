@@ -395,12 +395,20 @@ class CognitiveAgent:
         self.add_tool("introspect", "Read current self-model, drives, world beliefs, and open questions.", self._introspect_tool)
 
     def _respond_tool(self, arguments: Dict[str, Any]) -> ActionResult:
-        message = arguments.get("message") or arguments.get("input", "")
+        message = (
+            arguments.get("message")
+            or arguments.get("response")
+            or arguments.get("content")
+            or arguments.get("text")
+            or arguments.get("input", "")
+        )
         context = arguments.get("context") or arguments.get("workspace", "")
-        if context:
-            output = f"{context}\n\nResponse seed: {message}"
+        if message:
+            output = str(message)
+        elif context:
+            output = str(context)
         else:
-            output = f"Response seed: {message}"
+            output = ""
         return ActionResult(True, output)
 
     def _remember_tool(self, arguments: Dict[str, Any]) -> ActionResult:
