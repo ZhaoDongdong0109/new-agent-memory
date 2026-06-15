@@ -38,6 +38,9 @@ Homepage = "https://github.com/ZhaoDongdong0109/new-agent-memory"
 Repository = "https://github.com/ZhaoDongdong0109/new-agent-memory"
 Issues = "https://github.com/ZhaoDongdong0109/new-agent-memory/issues"
 
+[project.scripts]
+new-agent-memory = "new_agent_memory.cli:main"
+
 [tool.setuptools]
 py-modules = [
   "forgotten_layer",

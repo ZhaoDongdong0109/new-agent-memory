@@ -1,4 +1,16 @@
-from new_agent_memory import ActionResult, AgentAction, CognitiveAgent, HumanLikeMemorySystem, LLMPlanner
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+import threading
+
+from new_agent_memory import (
+    ActionResult,
+    AgentAction,
+    CognitiveAgent,
+    HumanLikeMemorySystem,
+    LLMPlanner,
+    OpenAICompatibleChatClient,
+    OpenAICompatibleConfig,
+)
 
 
 def test_llm_planner_parses_json_action():
@@ -62,3 +74,135 @@ def test_llm_planner_falls_back_for_unknown_tool():
 
     assert action.name == "respond"
     assert "unavailable tool" in action.arguments["message"]
+
+
+def test_openai_compatible_config_loads_dotenv(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "OPENAI_API_KEY=local-key",
+                "OPENAI_BASE_URL=http://localhost:1234/v1",
+                "OPENAI_MODEL=hermes-test",
+                "OPENAI_TEMPERATURE=0.25",
+                "OPENAI_MAX_TOKENS=256",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = OpenAICompatibleConfig.from_env(env_file=str(env_file), environ={})
+
+    assert config.api_key == "local-key"
+    assert config.base_url == "http://localhost:1234/v1"
+    assert config.model == "hermes-test"
+    assert config.temperature == 0.25
+    assert config.max_tokens == 256
+    assert config.chat_completions_url == "http://localhost:1234/v1/chat/completions"
+
+
+def test_openai_compatible_client_posts_chat_completion():
+    state = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            state["path"] = self.path
+            state["authorization"] = self.headers.get("Authorization")
+            state["payload"] = json.loads(self.rfile.read(length).decode("utf-8"))
+
+            response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"name": "respond", "arguments": {"message": "ok"}, "rationale": "test"}'
+                        }
+                    }
+                ]
+            }
+            body = json.dumps(response).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        config = OpenAICompatibleConfig(
+            api_key="test-key",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            model="fake-chat-model",
+            timeout=5,
+        )
+        client = OpenAICompatibleChatClient(config)
+
+        output = client("choose an action")
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+    assert json.loads(output)["name"] == "respond"
+    assert state["path"] == "/v1/chat/completions"
+    assert state["authorization"] == "Bearer test-key"
+    assert state["payload"]["model"] == "fake-chat-model"
+    assert state["payload"]["messages"][1]["content"] == "choose an action"
+
+
+def test_create_openai_agent_runs_against_compatible_endpoint():
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            self.rfile.read(length)
+            response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "name": "respond",
+                                    "arguments": {"message": "agent online"},
+                                    "rationale": "single-turn smoke test",
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            body = json.dumps(response).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        memory = HumanLikeMemorySystem()
+        agent = memory.create_openai_agent(
+            env_file=None,
+            api_key="test",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            model="fake-chat-model",
+            auto_consolidate=False,
+        )
+        episode = agent.run_turn("hello")
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+    assert episode.action.name == "respond"
+    assert episode.result.success is True
+    assert "agent online" in episode.result.output

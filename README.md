@@ -44,6 +44,61 @@ python -m pip install -e ".[dev]"
 
 项目当前没有强制运行时依赖；`dev` extra 只安装测试工具。
 
+## OpenAI-Compatible Quickstart
+
+配置 `.env`：
+
+```bash
+OPENAI_API_KEY=your-key-or-local-placeholder
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4.1-mini
+```
+
+如果你用 Hermes、LM Studio、vLLM、Ollama 网关或其他 OpenAI-compatible 服务，把 `OPENAI_BASE_URL` 改成对应的 `/v1` 地址即可，例如：
+
+```bash
+OPENAI_BASE_URL=http://localhost:1234/v1
+OPENAI_MODEL=hermes-3
+```
+
+单轮对话：
+
+```bash
+new-agent-memory ask "你现在是谁？用一句话说明你能做什么。"
+```
+
+交互式会话：
+
+```bash
+new-agent-memory chat --goal "帮助用户把记忆系统进化成可下载可运行的智能体"
+```
+
+Python 中直接创建：
+
+```python
+from new_agent_memory import HumanLikeMemorySystem
+
+memory = HumanLikeMemorySystem()
+agent = memory.create_openai_agent()
+episode = agent.run_turn("你现在能做什么？")
+print(episode.result.output)
+memory.save()
+```
+
+支持的环境变量：
+
+```text
+OPENAI_API_KEY
+OPENAI_BASE_URL
+OPENAI_MODEL
+OPENAI_TEMPERATURE
+OPENAI_MAX_TOKENS
+OPENAI_TIMEOUT
+OPENAI_USE_ENV_PROXY
+```
+
+也可以使用 `OPENAI_COMPATIBLE_*` 前缀，例如 `OPENAI_COMPATIBLE_BASE_URL`。
+
 ## Quickstart
 
 ```python
@@ -188,6 +243,29 @@ agent.planner = LLMPlanner(call_hermes_or_local_model)
 episode = agent.run_turn("下一步怎么做？")
 ```
 
+如果使用 OpenAI-compatible `/v1/chat/completions` 服务，可以直接从环境变量创建：
+
+```python
+from new_agent_memory import HumanLikeMemorySystem
+
+memory = HumanLikeMemorySystem()
+agent = memory.create_openai_agent()
+episode = agent.run_turn("请读取当前记忆和认知状态，然后回复我。")
+```
+
+也可以手动构造：
+
+```python
+from new_agent_memory import LLMPlanner, OpenAICompatibleConfig
+
+config = OpenAICompatibleConfig(
+    api_key="local-or-real-key",
+    base_url="http://localhost:1234/v1",
+    model="hermes-3",
+)
+planner = LLMPlanner.from_openai_compatible(config)
+```
+
 如果使用 OpenAI Responses 风格客户端，可以这样包一层：
 
 ```python
@@ -253,6 +331,7 @@ python examples/persona_adaptation.py
 python examples/attention_workspace.py
 python examples/cognitive_agent.py
 python examples/llm_planner.py
+python examples/openai_compatible_agent.py
 python examples/reflective_cognition.py
 ```
 
@@ -264,6 +343,7 @@ python examples/reflective_cognition.py
 - 目标驱动的注意力工作区
 - 数字身体闭环和经验巩固
 - LLM 决策器如何选择工具行动
+- OpenAI-compatible API 如何接入 Agent
 - 自我/世界模型、反思记录和 `introspect` 工具
 
 ## Architecture
@@ -394,8 +474,8 @@ python -m compileall .
 - [x] CognitiveAgent 数字身体闭环
 - [x] 模型无关 LLMPlanner
 - [x] CognitiveState 自我/世界模型与反思闭环
+- [x] Hermes / OpenAI-compatible Agent adapter
 - [ ] CLI：`memory add/search/stats`
-- [ ] Hermes / OpenAI-compatible Agent adapter
 - [ ] 自动记忆提取器 `MemoryExtractor`
 - [ ] 经验复盘与矛盾处理 `ConsolidationEngine`
 - [ ] SQLite 持久化后端
