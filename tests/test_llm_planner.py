@@ -96,6 +96,41 @@ def test_llm_planner_uses_heuristic_for_memory_request_after_invalid_json():
     assert "需要更强的目标生成" in action.arguments["content"]
 
 
+def test_llm_planner_rejects_remember_without_explicit_write_intent():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    outputs = iter(
+        [
+            '{"name": "remember", "arguments": {"content": "wrong"}, "rationale": "topic mentions memory"}',
+            "应该先回答自检问题，而不是保存记忆。",
+        ]
+    )
+    planner = LLMPlanner(lambda prompt: next(outputs))
+
+    action = planner(agent.observe("作为记忆智能体，你最弱的能力是什么？"), memory.focus("自检"), agent.tools)
+
+    assert action.name == "respond"
+    assert action.arguments["message"] == "应该先回答自检问题，而不是保存记忆。"
+    assert action.rationale == "LLMPlanner direct response fallback"
+
+
+def test_llm_planner_rejects_remember_when_user_negates_save_intent():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    outputs = iter(
+        [
+            '{"name": "remember", "arguments": {"content": "wrong"}, "rationale": "misread save"}',
+            "我会直接回答，不会保存这条内容。",
+        ]
+    )
+    planner = LLMPlanner(lambda prompt: next(outputs))
+
+    action = planner(agent.observe("请回答，不要保存记忆：你的目标是什么？"), memory.focus("自检"), agent.tools)
+
+    assert action.name == "respond"
+    assert action.arguments["message"] == "我会直接回答，不会保存这条内容。"
+
+
 def test_llm_planner_direct_response_fallback_for_plain_chat():
     memory = HumanLikeMemorySystem()
     agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
