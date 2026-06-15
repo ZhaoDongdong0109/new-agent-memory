@@ -450,16 +450,20 @@ class HumanLikeMemorySystem:
         name: str = "openai-compatible-agent",
         auto_consolidate: bool = True,
         env_file: Optional[str] = ".env",
+        synthesize_tool_responses: bool = True,
         **api_overrides: Any,
     ) -> CognitiveAgent:
         """Create an agent backed by an OpenAI-compatible ChatCompletions API."""
-        from core.llm_planner import LLMPlanner
+        from core.llm_planner import LLMPlanner, LLMResponseSynthesizer
 
         agent = self.create_agent(name=name, auto_consolidate=auto_consolidate)
-        agent.planner = LLMPlanner.from_openai_compatible_env(
+        planner = LLMPlanner.from_openai_compatible_env(
             env_file=env_file,
             **api_overrides,
         )
+        agent.planner = planner
+        if synthesize_tool_responses:
+            agent.response_synthesizer = LLMResponseSynthesizer(planner.llm)
         return agent
     
     # ============ 维护 ============

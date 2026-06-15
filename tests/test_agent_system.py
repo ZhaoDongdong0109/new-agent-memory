@@ -50,3 +50,49 @@ def test_agent_custom_tool_success_updates_experience():
     assert episode.result.success is True
     assert "echo hello" in episode.result.output
     assert 0 < episode.reward < 0.7
+
+
+def test_agent_synthesizes_non_respond_tool_result():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+
+    def inspect_tool(arguments):
+        return ActionResult(True, "raw internal state")
+
+    def planner(observation, workspace, tools):
+        return AgentAction(name="inspect", arguments={"target": "state"})
+
+    def synthesizer(observation, workspace, action, result):
+        return ActionResult(True, f"Final answer from {result.output}")
+
+    agent.add_tool("inspect", "Inspect current state.", inspect_tool)
+    agent.planner = planner
+    agent.response_synthesizer = synthesizer
+
+    episode = agent.run_turn("inspect and tell me the next step")
+
+    assert episode.action.name == "inspect"
+    assert episode.result.output == "Final answer from raw internal state"
+    assert episode.result.metadata["synthesized_from_tool"] == "inspect"
+    assert episode.result.metadata["tool_result"]["output"] == "raw internal state"
+
+
+def test_agent_skips_synthesizer_for_respond_action():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    calls = []
+
+    def planner(observation, workspace, tools):
+        return AgentAction(name="respond", arguments={"message": "direct"})
+
+    def synthesizer(observation, workspace, action, result):
+        calls.append(action.name)
+        return "should not run"
+
+    agent.planner = planner
+    agent.response_synthesizer = synthesizer
+
+    episode = agent.run_turn("hello")
+
+    assert episode.result.output == "direct"
+    assert calls == []

@@ -137,7 +137,19 @@ def _save_if_needed(memory: HumanLikeMemorySystem, args: argparse.Namespace):
         memory.save()
 
 
+def _configure_stdio():
+    """Keep Windows terminals from crashing on model output outside GBK."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def main(argv: Any = None) -> int:
+    _configure_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

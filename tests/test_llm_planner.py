@@ -8,6 +8,7 @@ from new_agent_memory import (
     CognitiveAgent,
     HumanLikeMemorySystem,
     LLMPlanner,
+    LLMResponseSynthesizer,
     OpenAICompatibleChatClient,
     OpenAICompatibleConfig,
 )
@@ -96,6 +97,16 @@ def test_llm_planner_uses_heuristic_for_memory_request_after_invalid_json():
     assert "需要更强的目标生成" in action.arguments["content"]
 
 
+def test_llm_planner_heuristic_respects_negative_memory_intent():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    planner = LLMPlanner(lambda prompt: "")
+
+    action = planner(agent.observe("please introspect current state; do not save this"), memory.focus("introspect"), agent.tools)
+
+    assert action.name == "introspect"
+
+
 def test_llm_planner_rejects_remember_without_explicit_write_intent():
     memory = HumanLikeMemorySystem()
     agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
@@ -154,6 +165,104 @@ def test_llm_planner_falls_back_for_unknown_tool():
 
     assert action.name == "respond"
     assert "unavailable tool" in action.arguments["message"]
+
+
+def test_llm_planner_honors_explicit_tool_request_over_respond():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    planner = LLMPlanner(lambda prompt: '{"name": "respond", "arguments": {"message": "old context"}}')
+
+    action = planner(agent.observe("please call introspect and then answer"), memory.focus("old context"), agent.tools)
+
+    assert action.name == "introspect"
+    assert action.rationale == "LLMPlanner guard: user explicitly requested tool 'introspect'."
+
+
+def test_llm_response_synthesizer_answers_from_tool_result():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+
+    def fake_llm(prompt):
+        assert "Original user message:" in prompt
+        assert "Tool result:" in prompt
+        assert "raw cognitive summary" in prompt
+        return "Next smallest experiment: review one dialogue, extract a hypothesis, then test recall."
+
+    synthesizer = LLMResponseSynthesizer(fake_llm)
+    observation = agent.observe("introspect and propose the next experiment")
+    workspace = memory.focus("introspect")
+    action = AgentAction(name="introspect", rationale="need self state")
+    result = ActionResult(True, "raw cognitive summary")
+
+    synthesized = synthesizer(observation, workspace, action, result)
+
+    assert synthesized is not None
+    assert synthesized.success is True
+    assert "Next smallest experiment" in synthesized.output
+    assert synthesized.metadata["kind"] == "llm_response_synthesis"
+    assert "Do not return JSON" in synthesizer.last_prompt
+
+
+def test_llm_response_synthesizer_rewrites_incomplete_output():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    outputs = iter(["Next experiment: start a goal (", "Next experiment: start one active goal and test recall."])
+
+    synthesizer = LLMResponseSynthesizer(lambda prompt: next(outputs))
+    observation = agent.observe("introspect and propose the next experiment")
+    workspace = memory.focus("introspect")
+    action = AgentAction(name="introspect")
+    result = ActionResult(True, "curiosity is low")
+
+    synthesized = synthesizer(observation, workspace, action, result)
+
+    assert synthesized.output == "Next experiment: start one active goal and test recall."
+    assert synthesized.metadata["rewritten_incomplete_output"] is True
+    assert "Rewrite it as one complete" in synthesizer.last_prompt
+    assert "Original user message is the task" in synthesizer.last_prompt
+
+
+def test_llm_response_synthesizer_rewrites_empty_output():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    outputs = iter(["", "Complete answer after empty synthesis."])
+
+    synthesizer = LLMResponseSynthesizer(lambda prompt: next(outputs))
+    observation = agent.observe("introspect and answer")
+    workspace = memory.focus("introspect")
+    action = AgentAction(name="introspect")
+    result = ActionResult(True, "state summary")
+
+    synthesized = synthesizer(observation, workspace, action, result)
+
+    assert synthesized.output == "Complete answer after empty synthesis."
+    assert synthesized.metadata["rewritten_empty_output"] is True
+
+
+def test_llm_response_synthesizer_omits_prior_open_questions_unless_requested():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    prompts = []
+
+    def fake_llm(prompt):
+        prompts.append(prompt)
+        return "current task answer"
+
+    synthesizer = LLMResponseSynthesizer(fake_llm)
+    observation = agent.observe("run an experiment and evaluate coherence")
+    workspace = memory.focus("experiment")
+    workspace.cognitive_context = {"open_questions": ["old workspace question"]}
+    action = AgentAction(name="introspect")
+    result = ActionResult(
+        True,
+        "identity: agent\nopen_questions:\n- old question that should not steer the answer\ntool_stats:\n- introspect: 1/1 successes",
+    )
+
+    synthesizer(observation, workspace, action, result)
+
+    assert "old question that should not steer the answer" not in prompts[0]
+    assert "old workspace question" not in prompts[0]
+    assert "prior open questions are not the current task" in prompts[0]
 
 
 def test_openai_compatible_config_loads_dotenv(tmp_path):
