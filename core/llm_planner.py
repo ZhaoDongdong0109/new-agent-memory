@@ -271,7 +271,8 @@ class LLMPlanner:
                         return heuristic
                     if self.config.direct_response_fallback:
                         return self._direct_response_fallback_action(observation, workspace, output)
-                return action
+                guarded = self._guard_action(action, observation, workspace, output)
+                return guarded
             prompt = self.build_repair_prompt(output, tools, original_prompt=original_prompt)
 
         return self.parse_action(output, tools)
@@ -309,6 +310,9 @@ Rules:
 - `name` must be one of the available tool names.
 - Use `respond` when no external tool is needed.
 - When using `respond`, put the final user-facing answer in `arguments.message`.
+- Use `remember` only when the user explicitly asks to remember, save, store, or record information.
+- Never use `remember` when the user says not to remember/save/store/record.
+- Do not use `remember` merely because the topic mentions memory or agents.
 - Keep `arguments.message` concise enough to fit inside valid JSON.
 - Keep arguments small and explicit.
 - Do not include markdown outside the JSON.
@@ -397,6 +401,56 @@ Previous invalid output:
                 rationale="LLMPlanner heuristic fallback: user asked for introspection.",
             )
         return fallback
+
+    def _guard_action(
+        self,
+        action: AgentAction,
+        observation: Observation,
+        workspace: FocusWorkspace,
+        raw_output: str,
+    ) -> AgentAction:
+        if action.name == "remember" and not self._has_memory_write_intent(observation.content):
+            return self._direct_response_fallback_action(
+                observation,
+                workspace,
+                f"Rejected remember action without explicit memory-write intent: {raw_output[:300]}",
+            )
+        return action
+
+    def _has_memory_write_intent(self, text: str) -> bool:
+        lowered = text.lower()
+        negative_markers = [
+            "do not remember",
+            "don't remember",
+            "do not save",
+            "don't save",
+            "do not store",
+            "don't store",
+            "不要记住",
+            "不要保存",
+            "不要存储",
+            "不要记录",
+            "别记住",
+            "别保存",
+            "别记录",
+            "不保存",
+            "不用保存",
+        ]
+        if any(marker in lowered for marker in negative_markers):
+            return False
+        markers = [
+            "remember",
+            "save this",
+            "store this",
+            "record this",
+            "记住",
+            "保存",
+            "存储",
+            "记录",
+            "保存成记忆",
+            "写入记忆",
+        ]
+        return any(marker in lowered for marker in markers)
 
     def _direct_response_fallback_action(
         self,

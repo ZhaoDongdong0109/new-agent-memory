@@ -391,7 +391,7 @@ class CognitiveAgent:
 
     def _register_default_tools(self):
         self.add_tool("respond", "Return a context-aware text response.", self._respond_tool)
-        self.add_tool("remember", "Store an explicit memory from the observation.", self._remember_tool)
+        self.add_tool("remember", "Store memory only when the user explicitly asks to remember/save/record something.", self._remember_tool)
         self.add_tool("introspect", "Read current self-model, drives, world beliefs, and open questions.", self._introspect_tool)
 
     def _respond_tool(self, arguments: Dict[str, Any]) -> ActionResult:
