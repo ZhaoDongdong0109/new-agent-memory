@@ -8,6 +8,7 @@ from new_agent_memory import (
     CognitiveAgent,
     HumanLikeMemorySystem,
     LLMPlanner,
+    LLMPlannerConfig,
     LLMResponseSynthesizer,
     OpenAICompatibleChatClient,
     OpenAICompatibleConfig,
@@ -105,6 +106,45 @@ def test_llm_planner_heuristic_respects_negative_memory_intent():
     action = planner(agent.observe("please introspect current state; do not save this"), memory.focus("introspect"), agent.tools)
 
     assert action.name == "introspect"
+
+
+def test_llm_planner_skips_tool_heuristics_inside_runtime_context():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    outputs = iter(["", "runtime direct answer"])
+    planner = LLMPlanner(lambda prompt: next(outputs), config=LLMPlannerConfig(json_repair_attempts=0))
+    observation = agent.observe(
+        "CognitiveRuntime trace mentions remember and introspect many times.",
+        source="runtime",
+        metadata={"runtime": True, "original_task": "answer first, then self-check"},
+    )
+
+    action = planner(observation, memory.focus("runtime"), agent.tools)
+
+    assert action.name == "respond"
+    assert action.arguments["message"] == "runtime direct answer"
+
+
+def test_llm_planner_rejects_runtime_remember_when_original_task_did_not_ask_to_save():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    outputs = iter(
+        [
+            '{"name": "remember", "arguments": {"content": "wrong"}, "rationale": "trace mentioned memory"}',
+            "runtime answer instead",
+        ]
+    )
+    planner = LLMPlanner(lambda prompt: next(outputs), config=LLMPlannerConfig(json_repair_attempts=0))
+    observation = agent.observe(
+        "CognitiveRuntime trace mentions remember.",
+        source="runtime",
+        metadata={"runtime": True, "original_task": "answer the question; do not save"},
+    )
+
+    action = planner(observation, memory.focus("runtime"), agent.tools)
+
+    assert action.name == "respond"
+    assert action.arguments["message"] == "runtime answer instead"
 
 
 def test_llm_planner_rejects_remember_without_explicit_write_intent():

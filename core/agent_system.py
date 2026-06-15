@@ -326,11 +326,27 @@ class CognitiveAgent:
         if hasattr(self.memory, "observe_world"):
             self.memory.observe_world(observation)
 
+        workspace = self.build_workspace(observation)
+        action = self.select_action(observation, workspace)
+        return self.execute_action(observation, workspace, action, consolidate=consolidate)
+
+    def build_workspace(self, observation: Observation) -> FocusWorkspace:
         workspace = self.memory.focus(observation.content, include_forgotten=True)
         if hasattr(self.memory, "attach_cognitive_context"):
             self.memory.attach_cognitive_context(workspace, tools=self.tools)
+        return workspace
 
-        action = self.planner(observation, workspace, self.tools)
+    def select_action(self, observation: Observation, workspace: FocusWorkspace) -> AgentAction:
+        return self.planner(observation, workspace, self.tools)
+
+    def execute_action(
+        self,
+        observation: Observation,
+        workspace: FocusWorkspace,
+        action: AgentAction,
+        synthesize: bool = True,
+        consolidate: Optional[bool] = None,
+    ) -> ExperienceEpisode:
         prediction = None
         if hasattr(self.memory, "predict_action"):
             prediction = self.memory.predict_action(action, tools=self.tools)
@@ -339,7 +355,7 @@ class CognitiveAgent:
         if prediction is not None:
             tool_result.metadata.setdefault("prediction", prediction.to_dict())
 
-        result = self._synthesize_result(observation, workspace, action, tool_result)
+        result = self._synthesize_result(observation, workspace, action, tool_result) if synthesize else tool_result
 
         reward = self.evaluator(observation, action, result)
         lesson = self._derive_lesson(observation, action, result, reward)

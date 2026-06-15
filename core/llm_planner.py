@@ -614,8 +614,11 @@ Previous invalid output:
         tools: ToolRegistry,
         fallback: AgentAction,
     ) -> AgentAction:
+        if observation.metadata.get("runtime"):
+            return fallback
+
         text = observation.content.lower()
-        if "remember" in tools.tools and self._has_memory_write_intent(observation.content):
+        if "remember" in tools.tools and self._has_memory_write_intent(self._intent_text(observation)):
             return AgentAction(
                 name="remember",
                 arguments={"content": observation.content},
@@ -639,20 +642,26 @@ Previous invalid output:
         tools: ToolRegistry,
         raw_output: str,
     ) -> AgentAction:
-        explicit_tool = self._explicit_tool_request(observation.content, tools)
+        intent_text = self._intent_text(observation)
+        explicit_tool = None if observation.metadata.get("runtime") else self._explicit_tool_request(intent_text, tools)
         if explicit_tool and action.name != explicit_tool:
             return AgentAction(
                 name=explicit_tool,
                 arguments={},
                 rationale=f"LLMPlanner guard: user explicitly requested tool '{explicit_tool}'.",
             )
-        if action.name == "remember" and not self._has_memory_write_intent(observation.content):
+        if action.name == "remember" and not self._has_memory_write_intent(intent_text):
             return self._direct_response_fallback_action(
                 observation,
                 workspace,
                 f"Rejected remember action without explicit memory-write intent: {raw_output[:300]}",
             )
         return action
+
+    def _intent_text(self, observation: Observation) -> str:
+        if observation.metadata.get("runtime") and observation.metadata.get("original_task"):
+            return str(observation.metadata["original_task"])
+        return observation.content
 
     def _explicit_tool_request(self, text: str, tools: ToolRegistry) -> Optional[str]:
         lowered = text.lower()

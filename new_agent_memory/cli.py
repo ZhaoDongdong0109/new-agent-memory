@@ -38,6 +38,8 @@ def _add_common_args(parser: argparse.ArgumentParser):
     parser.add_argument("--no-save", action="store_true", help="Do not save memory after running.")
     parser.add_argument("--show-action", action="store_true", help="Print selected action metadata.")
     parser.add_argument("--show-summary", action="store_true", help="Print cognitive summary after the turn.")
+    parser.add_argument("--runtime", action="store_true", help="Use the multi-step CognitiveRuntime loop.")
+    parser.add_argument("--max-steps", type=int, default=4, help="Maximum CognitiveRuntime steps.")
 
     parser.add_argument("--api-key", default=None, help="Override OPENAI_API_KEY.")
     parser.add_argument("--base-url", default=None, help="Override OPENAI_BASE_URL, e.g. http://localhost:1234/v1.")
@@ -48,15 +50,21 @@ def _add_common_args(parser: argparse.ArgumentParser):
 
 
 def run_ask(args: argparse.Namespace) -> int:
-    memory, agent = _build_memory_and_agent(args)
-    episode = agent.run_turn(args.message)
-    _print_episode(episode, args, memory)
+    memory, runner = _build_memory_and_runner(args)
+    if args.runtime:
+        run = runner.run(args.message)
+        _print_run(run, args, memory)
+        ok = run.result.success
+    else:
+        episode = runner.run_turn(args.message)
+        _print_episode(episode, args, memory)
+        ok = episode.result.success
     _save_if_needed(memory, args)
-    return 0 if episode.result.success else 1
+    return 0 if ok else 1
 
 
 def run_chat(args: argparse.Namespace) -> int:
-    memory, agent = _build_memory_and_agent(args)
+    memory, runner = _build_memory_and_runner(args)
     print("new-agent-memory chat. Type :quit to exit, :save to persist, :summary to inspect state.")
 
     while True:
@@ -79,26 +87,38 @@ def run_chat(args: argparse.Namespace) -> int:
             print(json.dumps(memory.get_cognitive_summary(), ensure_ascii=False, indent=2))
             continue
 
-        episode = agent.run_turn(message)
-        _print_episode(episode, args, memory)
+        if args.runtime:
+            run = runner.run(message)
+            _print_run(run, args, memory)
+        else:
+            episode = runner.run_turn(message)
+            _print_episode(episode, args, memory)
 
     _save_if_needed(memory, args)
     return 0
 
 
-def _build_memory_and_agent(args: argparse.Namespace):
+def _build_memory_and_runner(args: argparse.Namespace):
     memory = HumanLikeMemorySystem(data_dir=args.data_dir)
     if not args.fresh:
         memory.load()
     if args.goal:
         memory.start_goal(args.goal)
 
-    agent = memory.create_openai_agent(
-        name=args.name,
-        env_file=args.env_file,
-        **_api_overrides(args),
-    )
-    return memory, agent
+    if args.runtime:
+        runner = memory.create_openai_runtime(
+            name=args.name,
+            env_file=args.env_file,
+            max_steps=args.max_steps,
+            **_api_overrides(args),
+        )
+    else:
+        runner = memory.create_openai_agent(
+            name=args.name,
+            env_file=args.env_file,
+            **_api_overrides(args),
+        )
+    return memory, runner
 
 
 def _api_overrides(args: argparse.Namespace) -> Dict[str, Any]:
@@ -123,6 +143,38 @@ def _print_episode(episode: Any, args: argparse.Namespace, memory: HumanLikeMemo
                     "result": episode.result.to_dict(),
                     "reward": episode.reward,
                     "lesson": episode.lesson,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    if args.show_summary:
+        print(json.dumps(memory.get_cognitive_summary(), ensure_ascii=False, indent=2))
+
+
+def _print_run(run: Any, args: argparse.Namespace, memory: HumanLikeMemorySystem):
+    if run.result.output:
+        print(run.result.output)
+    if args.show_action:
+        print(
+            json.dumps(
+                {
+                    "runtime": {
+                        "id": run.id,
+                        "goal": run.goal,
+                        "completed": run.completed,
+                        "stop_reason": run.stop_reason,
+                    },
+                    "result": run.result.to_dict(),
+                    "steps": [
+                        {
+                            "index": step.index,
+                            "action": step.action.to_dict(),
+                            "result": step.result.to_dict(),
+                            "reward": step.reward,
+                        }
+                        for step in run.steps
+                    ],
                 },
                 ensure_ascii=False,
                 indent=2,

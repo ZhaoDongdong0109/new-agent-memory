@@ -85,6 +85,38 @@ print(episode.result.output)
 memory.save()
 ```
 
+### Cognitive Runtime
+
+Use the multi-step runtime when a task needs more than one internal action:
+
+```bash
+new-agent-memory ask --runtime --max-steps 4 \
+  "Answer first, then call introspect, then finish with two next questions."
+```
+
+Python API:
+
+```python
+from new_agent_memory import HumanLikeMemorySystem
+
+memory = HumanLikeMemorySystem()
+runtime = memory.create_openai_runtime(max_steps=4)
+run = runtime.run("Answer first, then call introspect, then finish.")
+
+print(run.result.output)
+print([step.action.name for step in run.steps])
+```
+
+`CognitiveRuntime` adds a small executive loop above `CognitiveAgent`:
+
+```text
+Observe -> Goal -> Focus -> Plan -> Act -> Reflect -> Continue/Finish
+```
+
+It registers a `finish` control tool, records each step as an `ExperienceEpisode`,
+guards against finishing before required tools actually run, and keeps runtime
+trace text separate from the user's original intent.
+
 支持的环境变量：
 
 ```text
