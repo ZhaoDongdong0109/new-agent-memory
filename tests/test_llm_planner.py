@@ -65,6 +65,37 @@ def test_llm_planner_falls_back_for_invalid_json():
     assert "Could not parse" in action.arguments["message"]
 
 
+def test_llm_planner_repairs_invalid_json_once():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    outputs = iter(
+        [
+            '```json\n{"name": "respond", "arguments": {"message": "broken"',
+            '{"name": "respond", "arguments": {"message": "repaired"}, "rationale": "retry"}',
+        ]
+    )
+    planner = LLMPlanner(lambda prompt: next(outputs))
+
+    action = planner(agent.observe("hello"), memory.focus("hello"), agent.tools)
+
+    assert action.name == "respond"
+    assert action.arguments["message"] == "repaired"
+    assert "Previous invalid output" in planner.last_prompt
+    assert "Original task context" in planner.last_prompt
+    assert "Observation:" in planner.last_prompt
+
+
+def test_llm_planner_uses_heuristic_for_memory_request_after_invalid_json():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    planner = LLMPlanner(lambda prompt: "")
+
+    action = planner(agent.observe("请把这个结论保存成记忆：需要更强的目标生成"), memory.focus("保存"), agent.tools)
+
+    assert action.name == "remember"
+    assert "需要更强的目标生成" in action.arguments["content"]
+
+
 def test_llm_planner_falls_back_for_unknown_tool():
     memory = HumanLikeMemorySystem()
     agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)

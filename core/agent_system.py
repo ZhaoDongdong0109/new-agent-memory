@@ -428,8 +428,43 @@ class CognitiveAgent:
         if not hasattr(self.memory, "get_cognitive_summary"):
             return ActionResult(False, "This memory system has no cognitive state.")
         summary = self.memory.get_cognitive_summary()
-        output = json.dumps(summary, ensure_ascii=False, indent=2)
+        if arguments.get("format") == "json":
+            output = json.dumps(summary, ensure_ascii=False, indent=2)
+        else:
+            output = self._format_cognitive_summary(summary)
         return ActionResult(True, output, metadata={"kind": "cognitive_summary"})
+
+    def _format_cognitive_summary(self, summary: Dict[str, Any]) -> str:
+        identity = summary.get("identity", {})
+        drives = summary.get("drives", {})
+        open_questions = summary.get("open_questions", [])
+        tool_stats = summary.get("tool_stats", {})
+
+        drive_lines = []
+        for name, drive in sorted(drives.items(), key=lambda item: item[1].get("urgency", 0), reverse=True)[:5]:
+            drive_lines.append(f"- {name}: value={drive.get('value', 0):.2f}, urgency={drive.get('urgency', 0):.2f}")
+
+        question_lines = [f"- {question}" for question in open_questions[-5:]] or ["- none"]
+        tool_lines = []
+        for name, stats in sorted(tool_stats.items()):
+            attempts = int(stats.get("attempts", 0))
+            successes = int(stats.get("successes", 0))
+            tool_lines.append(f"- {name}: {successes}/{attempts} successes")
+        if not tool_lines:
+            tool_lines.append("- none")
+
+        return "\n".join(
+            [
+                f"identity: {identity.get('name', self.name)}",
+                f"mission: {identity.get('mission', '')}",
+                "drives:",
+                *drive_lines,
+                "open_questions:",
+                *question_lines,
+                "tool_stats:",
+                *tool_lines,
+            ]
+        )
 
     def _derive_lesson(
         self,

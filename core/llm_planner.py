@@ -226,6 +226,7 @@ class LLMPlannerConfig:
     default_action: str = "respond"
     strict_tools: bool = True
     max_prompt_chars: int = 12000
+    json_repair_attempts: int = 1
 
 
 class LLMPlanner:
@@ -253,9 +254,21 @@ class LLMPlanner:
 
     def __call__(self, observation: Observation, workspace: FocusWorkspace, tools: ToolRegistry) -> AgentAction:
         prompt = self.build_prompt(observation, workspace, tools)
+        original_prompt = prompt
         self.last_prompt = prompt
-        output = self.llm(prompt)
-        self.last_output = output
+        output = ""
+
+        for attempt in range(self.config.json_repair_attempts + 1):
+            self.last_prompt = prompt
+            output = self.llm(prompt)
+            self.last_output = output
+            action = self.parse_action(output, tools)
+            if not self._is_parse_fallback(action) or attempt >= self.config.json_repair_attempts:
+                if self._is_parse_fallback(action):
+                    return self._heuristic_fallback_action(observation, tools, action)
+                return action
+            prompt = self.build_repair_prompt(output, tools, original_prompt=original_prompt)
+
         return self.parse_action(output, tools)
 
     def build_prompt(self, observation: Observation, workspace: FocusWorkspace, tools: ToolRegistry) -> str:
@@ -291,6 +304,7 @@ Rules:
 - `name` must be one of the available tool names.
 - Use `respond` when no external tool is needed.
 - When using `respond`, put the final user-facing answer in `arguments.message`.
+- Keep `arguments.message` concise enough to fit inside valid JSON.
 - Keep arguments small and explicit.
 - Do not include markdown outside the JSON.
 """.strip()
@@ -298,6 +312,32 @@ Rules:
         if len(prompt) <= self.config.max_prompt_chars:
             return prompt
         return prompt[: self.config.max_prompt_chars] + "\n...[truncated]"
+
+    def build_repair_prompt(self, invalid_output: str, tools: ToolRegistry, original_prompt: str = "") -> str:
+        tool_names = ", ".join(sorted(tools.tools))
+        return f"""
+Your previous output was not valid JSON or was truncated.
+Repair the output for the same original task. Do not answer this repair instruction as a new user request.
+
+Return ONLY one valid JSON object with this shape:
+{{
+  "name": "tool_name",
+  "arguments": {{}},
+  "rationale": "short reason"
+}}
+
+Rules:
+- `name` must be one of: {tool_names}
+- If using `respond`, put a concise final answer in `arguments.message`.
+- Do not use markdown fences.
+- Keep the whole JSON short.
+
+Original task context:
+{original_prompt[:1600]}
+
+Previous invalid output:
+{invalid_output[:1200]}
+""".strip()
 
     def parse_action(self, output: str, tools: ToolRegistry) -> AgentAction:
         try:
@@ -323,6 +363,35 @@ Rules:
             arguments={"message": reason},
             rationale="LLMPlanner fallback",
         )
+
+    def _is_parse_fallback(self, action: AgentAction) -> bool:
+        message = str(action.arguments.get("message", ""))
+        return action.rationale == "LLMPlanner fallback" and message.startswith("Could not parse planner JSON")
+
+    def _heuristic_fallback_action(
+        self,
+        observation: Observation,
+        tools: ToolRegistry,
+        fallback: AgentAction,
+    ) -> AgentAction:
+        text = observation.content.lower()
+        if "remember" in tools.tools and any(
+            marker in text for marker in ["remember", "记住", "保存", "存储", "记录", "保存成记忆"]
+        ):
+            return AgentAction(
+                name="remember",
+                arguments={"content": observation.content},
+                rationale="LLMPlanner heuristic fallback: user asked to store memory.",
+            )
+        if "introspect" in tools.tools and any(
+            marker in text for marker in ["introspect", "自省", "认知状态", "内部状态", "查看你自己"]
+        ):
+            return AgentAction(
+                name="introspect",
+                arguments={},
+                rationale="LLMPlanner heuristic fallback: user asked for introspection.",
+            )
+        return fallback
 
     def _extract_json(self, text: str) -> str:
         fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
