@@ -290,6 +290,7 @@ Return ONLY one JSON object with this shape:
 Rules:
 - `name` must be one of the available tool names.
 - Use `respond` when no external tool is needed.
+- When using `respond`, put the final user-facing answer in `arguments.message`.
 - Keep arguments small and explicit.
 - Do not include markdown outside the JSON.
 """.strip()
