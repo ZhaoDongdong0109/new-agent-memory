@@ -68,13 +68,14 @@ def run_chat(args: argparse.Namespace) -> int:
 
         if not message:
             continue
-        if message in {":q", ":quit", ":exit"}:
+        command = message.lower()
+        if command in {":q", ":quit", ":exit", "q", "quit", "exit"}:
             break
-        if message == ":save":
+        if command in {":save", "save"}:
             memory.save()
             print("saved")
             continue
-        if message == ":summary":
+        if command in {":summary", "summary"}:
             print(json.dumps(memory.get_cognitive_summary(), ensure_ascii=False, indent=2))
             continue
 

@@ -227,6 +227,7 @@ class LLMPlannerConfig:
     strict_tools: bool = True
     max_prompt_chars: int = 12000
     json_repair_attempts: int = 1
+    direct_response_fallback: bool = True
 
 
 class LLMPlanner:
@@ -265,7 +266,11 @@ class LLMPlanner:
             action = self.parse_action(output, tools)
             if not self._is_parse_fallback(action) or attempt >= self.config.json_repair_attempts:
                 if self._is_parse_fallback(action):
-                    return self._heuristic_fallback_action(observation, tools, action)
+                    heuristic = self._heuristic_fallback_action(observation, tools, action)
+                    if heuristic is not action:
+                        return heuristic
+                    if self.config.direct_response_fallback:
+                        return self._direct_response_fallback_action(observation, workspace, output)
                 return action
             prompt = self.build_repair_prompt(output, tools, original_prompt=original_prompt)
 
@@ -392,6 +397,49 @@ Previous invalid output:
                 rationale="LLMPlanner heuristic fallback: user asked for introspection.",
             )
         return fallback
+
+    def _direct_response_fallback_action(
+        self,
+        observation: Observation,
+        workspace: FocusWorkspace,
+        invalid_output: str,
+    ) -> AgentAction:
+        prompt = self.build_direct_response_prompt(observation, workspace, invalid_output)
+        self.last_prompt = prompt
+        output = self.llm(prompt).strip()
+        self.last_output = output
+        message = output or "我暂时没有拿到模型的有效输出，请再试一次，或检查当前 API 服务是否稳定。"
+        return AgentAction(
+            name=self.config.default_action,
+            arguments={"message": message},
+            rationale="LLMPlanner direct response fallback",
+        )
+
+    def build_direct_response_prompt(
+        self,
+        observation: Observation,
+        workspace: FocusWorkspace,
+        invalid_output: str,
+    ) -> str:
+        context = workspace.to_prompt_context()
+        return f"""
+The previous attempt to produce a JSON tool action failed.
+For this turn, answer the user directly in natural language.
+
+Rules:
+- Do not mention JSON, parser errors, or this fallback.
+- Keep the answer concise and useful.
+- Use the context only if it helps.
+
+Context:
+{context or "(empty)"}
+
+User message:
+{observation.content}
+
+Previous invalid output:
+{invalid_output[:500]}
+""".strip()
 
     def _extract_json(self, text: str) -> str:
         fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
