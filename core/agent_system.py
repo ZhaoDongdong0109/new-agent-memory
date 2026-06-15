@@ -256,6 +256,8 @@ class ToolRegistry:
 
 Planner = Callable[[Observation, FocusWorkspace, ToolRegistry], AgentAction]
 Evaluator = Callable[[Observation, AgentAction, ActionResult], float]
+SynthesizedResponse = Union[ActionResult, str, None]
+ResponseSynthesizer = Callable[[Observation, FocusWorkspace, AgentAction, ActionResult], SynthesizedResponse]
 
 
 def default_planner(observation: Observation, workspace: FocusWorkspace, tools: ToolRegistry) -> AgentAction:
@@ -296,6 +298,7 @@ class CognitiveAgent:
         name: str = "cognitive-agent",
         planner: Planner = default_planner,
         evaluator: Evaluator = default_evaluator,
+        response_synthesizer: Optional[ResponseSynthesizer] = None,
         experience_layer: Optional[ExperienceLayer] = None,
         auto_consolidate: bool = True,
     ):
@@ -303,6 +306,7 @@ class CognitiveAgent:
         self.name = name
         self.planner = planner
         self.evaluator = evaluator
+        self.response_synthesizer = response_synthesizer
         self.experience = experience_layer or ExperienceLayer()
         self.tools = ToolRegistry()
         self.auto_consolidate = auto_consolidate
@@ -331,9 +335,11 @@ class CognitiveAgent:
         if hasattr(self.memory, "predict_action"):
             prediction = self.memory.predict_action(action, tools=self.tools)
 
-        result = self.tools.run(action)
+        tool_result = self.tools.run(action)
         if prediction is not None:
-            result.metadata.setdefault("prediction", prediction.to_dict())
+            tool_result.metadata.setdefault("prediction", prediction.to_dict())
+
+        result = self._synthesize_result(observation, workspace, action, tool_result)
 
         reward = self.evaluator(observation, action, result)
         lesson = self._derive_lesson(observation, action, result, reward)
@@ -388,6 +394,41 @@ class CognitiveAgent:
             experience_layer=ExperienceLayer.from_dict(data.get("experience", {})),
             auto_consolidate=bool(data.get("auto_consolidate", True)),
         )
+
+    def _synthesize_result(
+        self,
+        observation: Observation,
+        workspace: FocusWorkspace,
+        action: AgentAction,
+        tool_result: ActionResult,
+    ) -> ActionResult:
+        """Optionally turn a raw tool result into a final user-facing response."""
+        if action.name == "respond" or self.response_synthesizer is None:
+            return tool_result
+
+        try:
+            synthesized = self.response_synthesizer(observation, workspace, action, tool_result)
+        except Exception as exc:
+            tool_result.metadata.setdefault("synthesis_error", f"{type(exc).__name__}: {exc}")
+            return tool_result
+
+        if synthesized is None:
+            tool_result.metadata.setdefault("synthesis_empty", True)
+            return tool_result
+        if isinstance(synthesized, str):
+            synthesized = ActionResult(tool_result.success, synthesized)
+        if not isinstance(synthesized, ActionResult) or not synthesized.output:
+            tool_result.metadata.setdefault("synthesis_empty", True)
+            return tool_result
+
+        synthesized.success = bool(synthesized.success and tool_result.success)
+        synthesized.cost += tool_result.cost
+        synthesized.metadata.setdefault("kind", "response_synthesis")
+        synthesized.metadata.setdefault("synthesized_from_tool", action.name)
+        synthesized.metadata.setdefault("tool_result", tool_result.to_dict())
+        if "prediction" in tool_result.metadata:
+            synthesized.metadata.setdefault("prediction", tool_result.metadata["prediction"])
+        return synthesized
 
     def _register_default_tools(self):
         self.add_tool("respond", "Return a context-aware text response.", self._respond_tool)
