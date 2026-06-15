@@ -61,8 +61,8 @@ def test_llm_planner_falls_back_for_invalid_json():
     action = planner(agent.observe("hello"), memory.focus("hello"), agent.tools)
 
     assert action.name == "respond"
-    assert action.rationale == "LLMPlanner fallback"
-    assert "Could not parse" in action.arguments["message"]
+    assert action.rationale == "LLMPlanner direct response fallback"
+    assert action.arguments["message"] == "not json"
 
 
 def test_llm_planner_repairs_invalid_json_once():
@@ -94,6 +94,20 @@ def test_llm_planner_uses_heuristic_for_memory_request_after_invalid_json():
 
     assert action.name == "remember"
     assert "需要更强的目标生成" in action.arguments["content"]
+
+
+def test_llm_planner_direct_response_fallback_for_plain_chat():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    outputs = iter(["", "", "你好，我是一个记忆驱动的智能体。"])
+    planner = LLMPlanner(lambda prompt: next(outputs))
+
+    action = planner(agent.observe("你好"), memory.focus("你好"), agent.tools)
+
+    assert action.name == "respond"
+    assert action.arguments["message"] == "你好，我是一个记忆驱动的智能体。"
+    assert action.rationale == "LLMPlanner direct response fallback"
+    assert "answer the user directly" in planner.last_prompt
 
 
 def test_llm_planner_falls_back_for_unknown_tool():

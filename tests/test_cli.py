@@ -3,6 +3,7 @@ import json
 import threading
 
 from new_agent_memory.cli import main
+import new_agent_memory.cli as cli
 
 
 def test_cli_ask_runs_one_turn_against_openai_compatible_endpoint(tmp_path, capsys):
@@ -63,3 +64,31 @@ def test_cli_ask_runs_one_turn_against_openai_compatible_endpoint(tmp_path, caps
     captured = capsys.readouterr()
     assert code == 0
     assert "cli agent online" in captured.out
+
+
+def test_cli_chat_accepts_summary_without_colon(monkeypatch, capsys):
+    class FakeMemory:
+        def load(self):
+            return False
+
+        def save(self):
+            return None
+
+        def start_goal(self, goal):
+            return None
+
+        def create_openai_agent(self, **kwargs):
+            return object()
+
+        def get_cognitive_summary(self):
+            return {"ok": True}
+
+    monkeypatch.setattr(cli, "HumanLikeMemorySystem", lambda data_dir: FakeMemory())
+    inputs = iter(["summary", "quit"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+
+    code = main(["chat", "--no-save"])
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert '"ok": true' in captured.out
