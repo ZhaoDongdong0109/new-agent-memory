@@ -6,16 +6,213 @@ and returns text. The returned text should contain a JSON action.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Dict, List, Mapping, Optional
 import json
+import os
 import re
+import urllib.error
+import urllib.request
 
 from core.agent_system import AgentAction, Observation, ToolRegistry
 from core.attention_system import FocusWorkspace
 
 
 LLMCallable = Callable[[str], str]
+
+
+def _parse_bool(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_float(value: Optional[str], default: float) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _parse_optional_int(value: Optional[str]) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def load_env_file(path: Optional[str] = ".env") -> Dict[str, str]:
+    """Load simple KEY=VALUE pairs without requiring python-dotenv."""
+    if not path or not os.path.exists(path):
+        return {}
+
+    values: Dict[str, str] = {}
+    with open(path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("'\"")
+            if key:
+                values[key] = value
+    return values
+
+
+@dataclass
+class OpenAICompatibleConfig:
+    """Configuration for OpenAI-compatible Chat Completions endpoints."""
+
+    model: str = "gpt-4.1-mini"
+    api_key: Optional[str] = None
+    base_url: str = "https://api.openai.com/v1"
+    timeout: float = 60.0
+    temperature: float = 0.1
+    max_tokens: Optional[int] = 800
+    stream: bool = False
+    use_env_proxy: bool = False
+    extra_headers: Dict[str, str] = field(default_factory=dict)
+    extra_body: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def chat_completions_url(self) -> str:
+        base = self.base_url.rstrip("/")
+        if base.endswith("/chat/completions"):
+            return base
+        return f"{base}/chat/completions"
+
+    @classmethod
+    def from_env(
+        cls,
+        env_file: Optional[str] = ".env",
+        environ: Optional[Mapping[str, str]] = None,
+        **overrides: Any,
+    ) -> "OpenAICompatibleConfig":
+        """Build config from .env + process env + explicit keyword overrides."""
+        merged: Dict[str, str] = {}
+        merged.update(load_env_file(env_file))
+        merged.update(dict(os.environ if environ is None else environ))
+
+        config = cls(
+            model=merged.get("OPENAI_COMPATIBLE_MODEL")
+            or merged.get("OPENAI_MODEL")
+            or cls.model,
+            api_key=merged.get("OPENAI_COMPATIBLE_API_KEY")
+            or merged.get("OPENAI_API_KEY"),
+            base_url=merged.get("OPENAI_COMPATIBLE_BASE_URL")
+            or merged.get("OPENAI_BASE_URL")
+            or merged.get("OPENAI_API_BASE")
+            or cls.base_url,
+            timeout=_parse_float(merged.get("OPENAI_COMPATIBLE_TIMEOUT") or merged.get("OPENAI_TIMEOUT"), cls.timeout),
+            temperature=_parse_float(
+                merged.get("OPENAI_COMPATIBLE_TEMPERATURE") or merged.get("OPENAI_TEMPERATURE"),
+                cls.temperature,
+            ),
+            max_tokens=_parse_optional_int(
+                merged.get("OPENAI_COMPATIBLE_MAX_TOKENS") or merged.get("OPENAI_MAX_TOKENS")
+            )
+            or cls.max_tokens,
+            stream=_parse_bool(merged.get("OPENAI_COMPATIBLE_STREAM") or merged.get("OPENAI_STREAM"), cls.stream),
+            use_env_proxy=_parse_bool(
+                merged.get("OPENAI_COMPATIBLE_USE_ENV_PROXY") or merged.get("OPENAI_USE_ENV_PROXY"),
+                cls.use_env_proxy,
+            ),
+        )
+
+        clean_overrides = {key: value for key, value in overrides.items() if value is not None}
+        if clean_overrides:
+            config = replace(config, **clean_overrides)
+        return config
+
+
+class OpenAICompatibleChatClient:
+    """Tiny stdlib client for /v1/chat/completions compatible APIs."""
+
+    def __init__(self, config: Optional[OpenAICompatibleConfig] = None):
+        self.config = config or OpenAICompatibleConfig.from_env()
+        self.last_request: Dict[str, Any] = {}
+        self.last_response: Dict[str, Any] = {}
+
+    def __call__(self, prompt: str) -> str:
+        if self.config.stream:
+            raise RuntimeError("Streaming responses are not supported yet; set OPENAI_STREAM=false.")
+
+        payload = {
+            "model": self.config.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Return only the JSON action requested by the user prompt.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": self.config.temperature,
+            "stream": self.config.stream,
+        }
+        if self.config.max_tokens is not None:
+            payload["max_tokens"] = self.config.max_tokens
+        payload.update(self.config.extra_body)
+
+        headers = {
+            "Content-Type": "application/json",
+            **self.config.extra_headers,
+        }
+        if self.config.api_key:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+
+        self.last_request = {"url": self.config.chat_completions_url, "payload": payload, "headers": dict(headers)}
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            self.config.chat_completions_url,
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+
+        opener = (
+            urllib.request.build_opener()
+            if self.config.use_env_proxy
+            else urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        )
+
+        try:
+            with opener.open(request, timeout=self.config.timeout) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"OpenAI-compatible API HTTP {exc.code}: {detail[:500]}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"OpenAI-compatible API connection failed: {exc}") from exc
+        except OSError as exc:
+            raise RuntimeError(f"OpenAI-compatible API connection failed: {exc}") from exc
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"OpenAI-compatible API returned invalid JSON: {raw[:500]}") from exc
+        self.last_response = data
+        return self._extract_text(data)
+
+    def _extract_text(self, data: Dict[str, Any]) -> str:
+        choices = data.get("choices") or []
+        if choices:
+            message = choices[0].get("message") or {}
+            content = message.get("content", "")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return "".join(
+                    item.get("text", "") if isinstance(item, dict) else str(item)
+                    for item in content
+                )
+        if "output_text" in data:
+            return str(data["output_text"])
+        raise RuntimeError("OpenAI-compatible API response did not include message content.")
 
 
 @dataclass
@@ -188,3 +385,31 @@ Rules:
             return str(response)
 
         return cls(llm=llm, config=config)
+
+    @classmethod
+    def from_openai_compatible(
+        cls,
+        api_config: Optional[OpenAICompatibleConfig] = None,
+        planner_config: Optional[LLMPlannerConfig] = None,
+        **api_overrides: Any,
+    ) -> "LLMPlanner":
+        """Build a planner from a /v1/chat/completions compatible endpoint."""
+        if api_config is None:
+            api_config = OpenAICompatibleConfig.from_env(**api_overrides)
+        elif api_overrides:
+            api_config = replace(
+                api_config,
+                **{key: value for key, value in api_overrides.items() if value is not None},
+            )
+        return cls(llm=OpenAICompatibleChatClient(api_config), config=planner_config)
+
+    @classmethod
+    def from_openai_compatible_env(
+        cls,
+        env_file: Optional[str] = ".env",
+        planner_config: Optional[LLMPlannerConfig] = None,
+        **api_overrides: Any,
+    ) -> "LLMPlanner":
+        """Build a planner from environment variables and an optional .env file."""
+        api_config = OpenAICompatibleConfig.from_env(env_file=env_file, **api_overrides)
+        return cls.from_openai_compatible(api_config=api_config, planner_config=planner_config)

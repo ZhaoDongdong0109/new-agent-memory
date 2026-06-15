@@ -12,7 +12,14 @@ from core.agent_system import (
     ExperienceLayer,
     Observation,
 )
-from core.llm_planner import LLMCallable, LLMPlanner, LLMPlannerConfig
+from core.llm_planner import (
+    LLMCallable,
+    LLMPlanner,
+    LLMPlannerConfig,
+    OpenAICompatibleChatClient,
+    OpenAICompatibleConfig,
+    load_env_file,
+)
 from core.cognitive_state import (
     ActionExpectation,
     CognitiveFrame,
@@ -43,6 +50,8 @@ __all__ = [
     "LLMCallable",
     "LLMPlanner",
     "LLMPlannerConfig",
+    "OpenAICompatibleChatClient",
+    "OpenAICompatibleConfig",
     "MemoryChunk",
     "MemoryLayer",
     "MemoryType",
@@ -53,5 +62,6 @@ __all__ = [
     "ReviewResult",
     "WorldBelief",
     "WorldEntity",
+    "load_env_file",
     "__version__",
 ]
