@@ -105,40 +105,46 @@ class ReconstructionResult:
 class MemoryRetrieval:
     """
     记忆检索与重建系统
-    
+
     工作流程：
     1. 解析输入 → QueryContext
-    2. 核心层检索
+    2. 核心层检索（支持混合检索）
     3. 若失败 → 伪遗忘层唤醒
     4. 碎片组装
     5. 审阅
     6. 输出
+
+    重构：支持混合检索（BM25 + Dense + Metadata）
     """
-    
+
     def __init__(
         self,
         core_layer: MemoryLayerCore,
         forgotten_layer: ForgottenLayer,
-        
+
+        # 混合检索器（可选）
+        planner=None,
+
         # 检索参数
         core_min_weight: float = 0.2,
         core_limit: int = 10,
         forgotten_min_match: int = 2,
-        
+
         # 组装参数
         assembly_method: str = "chronological",  # chronological / relevance / hybrid
-        
+
         # 审阅参数
         review_confidence_threshold: float = 0.5,  # 低于此值标记为 questionable
     ):
         self.core = core_layer
         self.forgotten = forgotten_layer
+        self.planner = planner  # QueryPlanner 实例
         self.core_min_weight = core_min_weight
         self.core_limit = core_limit
         self.forgotten_min_match = forgotten_min_match
         self.assembly_method = assembly_method
         self.review_confidence_threshold = review_confidence_threshold
-        
+
         # 统计
         self.total_retrievals = 0
         self.core_hit = 0
@@ -264,61 +270,94 @@ class MemoryRetrieval:
     ) -> ReconstructionResult:
         """
         主检索入口
-        
+
         流程：
         1. 解析查询
-        2. 核心层检索
+        2. 混合检索（如果 planner 可用）或传统检索
         3. 伪遗忘层唤醒（如需要）
         4. 组装 + 审阅
         5. 返回结果
         """
         self.total_retrievals += 1
-        
+
         # Step 1: 解析
         ctx = self.parse_query(query)
-        
-        # Step 2: 核心层检索
-        core_results = self.core.retrieve(
-            ctx.to_tags(),
-            min_weight=self.core_min_weight,
-            limit=self.core_limit,
-        )
-        
+
+        # Step 2: 检索（混合或传统）
         retrieval_path = ""
         all_chunks = []
-        
-        if core_results:
-            # 核心层命中
-            retrieval_path = "core"
-            self.core_hit += 1
-            all_chunks = [chunk for chunk, _ in core_results]
-            
-            # Hebbian 关联扩展（把相关记忆也拉进来）
-            expanded = self._expand_via_associations(all_chunks)
-            
-            # 用ID去重
-            seen_ids = {c.id for c in all_chunks}
-            for c in expanded:
-                if c.id not in seen_ids:
-                    all_chunks.append(c)
-                    seen_ids.add(c.id)
-            
-        elif allow_forgotten:
-            # Step 3: 核心层没命中，尝试伪遗忘层唤醒
-            retrieval_path = "forgotten"
-            forgotten_results = self.forgotten.try_wake(
-                ctx.to_tags(),
-                limit=5,
+
+        if self.planner:
+            # 使用混合检索
+            hybrid_results = self.planner.plan_and_retrieve(
+                query=query,
+                query_tags=ctx.to_tags(),
+                limit=self.core_limit,
             )
-            
-            if forgotten_results:
-                self.forgotten_hit += 1
-                all_chunks = [chunk for chunk, _ in forgotten_results]
+
+            if hybrid_results:
+                retrieval_path = "hybrid"
+                self.core_hit += 1
+                all_chunks = [chunk for chunk, _ in hybrid_results]
+
+                # Hebbian 关联扩展
+                expanded = self._expand_via_associations(all_chunks)
+                seen_ids = {c.id for c in all_chunks}
+                for c in expanded:
+                    if c.id not in seen_ids:
+                        all_chunks.append(c)
+                        seen_ids.add(c.id)
+            elif allow_forgotten:
+                # 混合检索没命中，尝试伪遗忘层唤醒
                 retrieval_path = "forgotten"
+                forgotten_results = self.forgotten.try_wake(
+                    ctx.to_tags(),
+                    limit=5,
+                )
+
+                if forgotten_results:
+                    self.forgotten_hit += 1
+                    all_chunks = [chunk for chunk, _ in forgotten_results]
+                else:
+                    retrieval_path = "none"
             else:
                 retrieval_path = "none"
         else:
-            retrieval_path = "none"
+            # 传统检索（向后兼容）
+            core_results = self.core.retrieve(
+                ctx.to_tags(),
+                min_weight=self.core_min_weight,
+                limit=self.core_limit,
+            )
+
+            if core_results:
+                retrieval_path = "core"
+                self.core_hit += 1
+                all_chunks = [chunk for chunk, _ in core_results]
+
+                # Hebbian 关联扩展
+                expanded = self._expand_via_associations(all_chunks)
+                seen_ids = {c.id for c in all_chunks}
+                for c in expanded:
+                    if c.id not in seen_ids:
+                        all_chunks.append(c)
+                        seen_ids.add(c.id)
+
+            elif allow_forgotten:
+                # 核心层没命中，尝试伪遗忘层唤醒
+                retrieval_path = "forgotten"
+                forgotten_results = self.forgotten.try_wake(
+                    ctx.to_tags(),
+                    limit=5,
+                )
+
+                if forgotten_results:
+                    self.forgotten_hit += 1
+                    all_chunks = [chunk for chunk, _ in forgotten_results]
+                else:
+                    retrieval_path = "none"
+            else:
+                retrieval_path = "none"
         
         # 如果都没有命中
         if not all_chunks:

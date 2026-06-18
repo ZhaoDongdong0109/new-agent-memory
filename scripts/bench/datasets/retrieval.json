@@ -1,0 +1,52 @@
+[
+    {
+        "query": "今天中午吃了什么",
+        "expected_ids": ["mem_food_001"],
+        "category": "factual"
+    },
+    {
+        "query": "上次出差去了哪里",
+        "expected_ids": ["mem_travel_001"],
+        "category": "temporal"
+    },
+    {
+        "query": "和张三一起做了什么",
+        "expected_ids": ["mem_person_001"],
+        "category": "person"
+    },
+    {
+        "query": "北京的天气怎么样",
+        "expected_ids": ["mem_location_001"],
+        "category": "location"
+    },
+    {
+        "query": "项目进展如何",
+        "expected_ids": ["mem_work_001"],
+        "category": "work"
+    },
+    {
+        "query": "上次看电影是什么时候",
+        "expected_ids": ["mem_entertainment_001"],
+        "category": "temporal"
+    },
+    {
+        "query": "学习了什么新知识",
+        "expected_ids": ["mem_learning_001"],
+        "category": "learning"
+    },
+    {
+        "query": "运动了多长时间",
+        "expected_ids": ["mem_exercise_001"],
+        "category": "health"
+    },
+    {
+        "query": "和客户讨论了什么",
+        "expected_ids": ["mem_work_002"],
+        "category": "work"
+    },
+    {
+        "query": "晚餐吃了什么",
+        "expected_ids": ["mem_food_002"],
+        "category": "factual"
+    }
+]
