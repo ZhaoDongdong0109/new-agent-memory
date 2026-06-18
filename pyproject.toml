@@ -40,6 +40,8 @@ Issues = "https://github.com/ZhaoDongdong0109/new-agent-memory/issues"
 
 [project.scripts]
 new-agent-memory = "new_agent_memory.cli:main"
+agent-hub = "hub.cli:main"
+hub-sub-agent = "adapters.hub_sub_agent:main"
 
 [tool.setuptools]
 py-modules = [
@@ -49,7 +51,7 @@ py-modules = [
   "memory_layer_core",
   "retrieval",
 ]
-packages = ["core", "new_agent_memory"]
+packages = ["core", "new_agent_memory", "hub", "adapters"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

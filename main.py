@@ -2,10 +2,13 @@
 类人记忆系统 - 主入口
 
 整合所有模块，提供统一的API
+
+重构：支持可插拔存储后端（json / sqlite）
 """
 
 from typing import Dict, List, Optional, Any
 import json
+import os
 import time
 
 from memory_chunk import MemoryChunk, MemoryLayer
@@ -22,11 +25,15 @@ from core.cognitive_state import ActionExpectation, CognitiveFrame, CognitiveSta
 class HumanLikeMemorySystem:
     """
     类人记忆系统
-    
+
     使用示例：
-    
+
+    # 默认 JSON 后端（向后兼容）
     system = HumanLikeMemorySystem()
-    
+
+    # 使用 SQLite 后端
+    system = HumanLikeMemorySystem(store_backend="sqlite")
+
     # 添加记忆
     system.add_memory(
         content="今天中午和客户在北京餐厅吃了烤鸭",
@@ -38,36 +45,45 @@ class HumanLikeMemorySystem:
         emotion_valence=0.3,
         importance=0.7,
     )
-    
+
     # 检索记忆
     result = system.retrieve("10年前中午吃了什么")
-    
+
     print(result.assembled_content)
     """
-    
+
     def __init__(
         self,
         data_dir: str = "./memory_data",
-        
+
+        # 存储后端："json" 或 "sqlite"
+        store_backend: str = "json",
+
         # 核心层参数
         core_decay_half_life: float = 7 * 24 * 3600,
         core_degrade_threshold: float = 0.15,
-        
+
         # 伪遗忘层参数
         forgotten_cleanup_age_days: float = 365,
-        
+
         # 检索参数
         retrieval_confidence_threshold: float = 0.5,
     ):
         self.data_dir = data_dir
-        
+        self.store_backend = store_backend
+
+        # 创建存储后端
+        core_store, forgotten_store = self._create_stores(store_backend, data_dir)
+
         # 初始化各层
         self.core = MemoryLayerCore(
+            store=core_store,
             decay_half_life=core_decay_half_life,
             degrade_threshold=core_degrade_threshold,
         )
-        
+
         self.forgotten = ForgottenLayer(
+            store=forgotten_store,
             cleanup_age_days=forgotten_cleanup_age_days,
         )
         
@@ -87,7 +103,34 @@ class HumanLikeMemorySystem:
         # 定时任务
         self.last_maintenance = time.time()
         self.maintenance_interval = 6 * 3600  # 每6小时维护一次
-    
+
+    @staticmethod
+    def _create_stores(backend: str, data_dir: str):
+        """
+        根据后端类型创建存储实例
+
+        Args:
+            backend: "json" 或 "sqlite"
+            data_dir: 数据目录
+
+        Returns:
+            (core_store, forgotten_store) 元组
+        """
+        os.makedirs(data_dir, exist_ok=True)
+
+        if backend == "sqlite":
+            from core.sqlite_store import SqliteMemoryStore
+            db_path = os.path.join(data_dir, "memory.db")
+            core_store = SqliteMemoryStore(db_path, table_prefix="core_")
+            forgotten_store = SqliteMemoryStore(db_path, table_prefix="forgotten_")
+        else:
+            # 默认 JSON 后端
+            from core.json_store import JsonMemoryStore
+            core_store = JsonMemoryStore(os.path.join(data_dir, "core.json"))
+            forgotten_store = JsonMemoryStore(os.path.join(data_dir, "forgotten.json"))
+
+        return core_store, forgotten_store
+
     # ============ 记忆操作 ============
     
     def add_memory(
@@ -535,11 +578,11 @@ class HumanLikeMemorySystem:
     
     def save(self):
         """保存所有数据"""
-        import os
         os.makedirs(self.data_dir, exist_ok=True)
-        
-        self.core.save(f"{self.data_dir}/core.json")
-        self.forgotten.save(f"{self.data_dir}/forgotten.json")
+
+        # 保存核心层和伪遗忘层（委托给 store）
+        self.core.save()
+        self.forgotten.save()
         
         # 保存人格适应层
         import json
@@ -558,19 +601,11 @@ class HumanLikeMemorySystem:
     
     def load(self) -> bool:
         """加载数据"""
-        import os
-        import json
-        
-        core_path = f"{self.data_dir}/core.json"
-        forgotten_path = f"{self.data_dir}/forgotten.json"
-        persona_path = f"{self.data_dir}/persona.json"
-        attention_path = f"{self.data_dir}/attention.json"
-        cognitive_path = f"{self.data_dir}/cognitive_state.json"
-        
-        core_loaded = self.core.load(core_path) if os.path.exists(core_path) else False
-        forgotten_loaded = self.forgotten.load(forgotten_path) if os.path.exists(forgotten_path) else False
-        
+        core_loaded = self.core.load()
+        forgotten_loaded = self.forgotten.load()
+
         # 加载人格适应层
+        persona_path = f"{self.data_dir}/persona.json"
         persona_loaded = False
         if os.path.exists(persona_path):
             try:
@@ -582,6 +617,7 @@ class HumanLikeMemorySystem:
                 pass
 
         # 加载注意力调度层
+        attention_path = f"{self.data_dir}/attention.json"
         attention_loaded = False
         if os.path.exists(attention_path):
             try:
@@ -592,6 +628,7 @@ class HumanLikeMemorySystem:
             except Exception:
                 pass
 
+        cognitive_path = f"{self.data_dir}/cognitive_state.json"
         cognitive_loaded = False
         if os.path.exists(cognitive_path):
             try:

@@ -1,0 +1,37 @@
+services:
+  hub:
+    build:
+      context: .
+    image: new-agent-memory:local
+    ports:
+      - "8420:8420"
+    volumes:
+      - ./hub_data:/app/hub_data
+      - ./memory_data:/app/memory_data
+    command: ["agent-hub", "start", "--memory-integration"]
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: .
+    image: new-agent-memory:local
+    env_file:
+      - .env
+    volumes:
+      - ./memory_data:/app/memory_data
+    stdin_open: true
+    tty: true
+    command: ["chat", "--runtime", "--max-steps", "4"]
+
+  hub-sub-agent:
+    build:
+      context: .
+    image: new-agent-memory:local
+    environment:
+      - HUB_URL=http://hub:8420
+    volumes:
+      - /tmp:/tmp
+    command: ["hub-sub-agent"]
+    restart: unless-stopped
+    depends_on:
+      - hub
