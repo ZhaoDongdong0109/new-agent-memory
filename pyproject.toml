@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "new-agent-memory"
@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "Explainable human-like memory layer for AI agents."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "AGPL-3.0-or-later" }
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
 authors = [
   { name = "ZhaoDongdong0109" }
 ]
@@ -43,14 +44,7 @@ new-agent-memory = "new_agent_memory.cli:main"
 agent-hub = "hub.cli:main"
 hub-sub-agent = "adapters.hub_sub_agent:main"
 
-[tool.setuptools]
-py-modules = [
-  "forgotten_layer",
-  "main",
-  "memory_chunk",
-  "memory_layer_core",
-  "retrieval",
-]
+[tool.hatch.build.targets.wheel]
 packages = ["core", "new_agent_memory", "hub", "adapters"]
 
 [tool.pytest.ini_options]
