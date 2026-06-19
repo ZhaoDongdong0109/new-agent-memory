@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "memory": {
+      "command": "python3",
+      "args": ["/mnt/e/codex/new-agent-memory/mcp_server.py"]
+    }
+  }
+}

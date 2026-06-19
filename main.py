@@ -68,9 +68,18 @@ class HumanLikeMemorySystem:
 
         # 检索参数
         retrieval_confidence_threshold: float = 0.5,
+
+        # 安全与治理参数
+        enable_pii_detection: bool = True,
+        enable_audit_log: bool = True,
+        audit_log_file: Optional[str] = None,
+
+        # LLM 函数（可选）
+        llm_fn: Optional[Any] = None,
     ):
         self.data_dir = data_dir
         self.store_backend = store_backend
+        self.llm_fn = llm_fn
 
         # 创建存储后端
         core_store, forgotten_store = self._create_stores(store_backend, data_dir)
@@ -86,7 +95,7 @@ class HumanLikeMemorySystem:
             store=forgotten_store,
             cleanup_age_days=forgotten_cleanup_age_days,
         )
-        
+
         self.retrieval = MemoryRetrieval(
             core_layer=self.core,
             forgotten_layer=self.forgotten,
@@ -99,7 +108,24 @@ class HumanLikeMemorySystem:
         # 目标驱动注意力调度层
         self.attention = AttentionOS()
         self.cognitive_state = CognitiveState()
-        
+
+        # 安全与治理层
+        self.enable_pii_detection = enable_pii_detection
+        self.enable_audit_log = enable_audit_log
+
+        if enable_pii_detection:
+            from core.pii_handler import PIIHandler
+            self.pii_handler = PIIHandler()
+        else:
+            self.pii_handler = None
+
+        if enable_audit_log:
+            from core.audit_logger import AuditLogger
+            log_file = audit_log_file or os.path.join(data_dir, "audit.log")
+            self.audit_logger = AuditLogger(log_file=log_file)
+        else:
+            self.audit_logger = None
+
         # 定时任务
         self.last_maintenance = time.time()
         self.maintenance_interval = 6 * 3600  # 每6小时维护一次
@@ -137,82 +163,383 @@ class HumanLikeMemorySystem:
         self,
         content: str,
         memory_type: MemoryType = MemoryType.INTERACTION,
-        
+
         # 时间维度
         time_absolute: Optional[str] = None,
         time_relative: Optional[str] = None,
         time_context: Optional[str] = None,
-        
+
         # 空间维度
         location: Optional[str] = None,
         location_detail: Optional[str] = None,
-        
+
         # 人物维度
         persons: Optional[List[str]] = None,
-        
+
         # 主题维度
         topics: Optional[List[str]] = None,
         keywords: Optional[List[str]] = None,
-        
+
         # 情绪维度
         emotion_valence: float = 0.0,
         emotion_intensity: float = 0.0,
-        
+
         # 重要性
         importance: float = 0.5,
-        
+
         # 元数据
         metadata: Optional[Dict[str, Any]] = None,
-        
+
         # 直接指定层级
         target_layer: Optional[MemoryLayer] = None,
+
+        # 新增：统一 schema 字段
+        source: str = "user",  # user / system_extract / import / consolidation
+        confidence: float = 0.8,
+        valid_at: Optional[float] = None,
+        invalid_at: Optional[float] = None,
+        user_id: str = "default",
+        session_id: Optional[str] = None,
+        version: int = 1,
     ) -> str:
         """
         添加记忆
-        
+
         返回记忆ID
         """
+        # PII 检测与脱敏
+        if self.pii_handler and self.pii_handler.has_pii(content):
+            pii_types = list(self.pii_handler.get_pii_types(content))
+            content = self.pii_handler.redact(content)
+
+            # 记录 PII 检测审计
+            if self.audit_logger:
+                import hashlib
+                text_hash = hashlib.md5(content.encode()).hexdigest()[:16]
+                self.audit_logger.log_pii_detection(
+                    text_hash=text_hash,
+                    pii_types=pii_types,
+                    action="redact",
+                )
+
         chunk = MemoryChunk(
             content=content,
             memory_type=memory_type,
-            
+
             time_absolute=time_absolute,
             time_relative=time_relative,
             time_context=time_context,
-            
+
             location=location,
             location_detail=location_detail,
-            
+
             persons=set(persons) if persons else set(),
             topics=set(topics) if topics else set(),
             keywords=set(keywords) if keywords else set(),
-            
+
             emotion_valence=emotion_valence,
             emotion_intensity=emotion_intensity,
-            
+
             importance=importance,
-            
+
             metadata=metadata or {},
+
+            # 新增字段
+            source=source,
+            confidence=confidence,
+            valid_at=valid_at,
+            invalid_at=invalid_at,
+            user_id=user_id,
+            session_id=session_id,
+            version=version,
         )
-        
+
         if target_layer == MemoryLayer.FORGOTTEN:
             self.forgotten.archive(chunk)
         else:
             self.core.add(chunk)
-        
+
+        # 记录创建审计
+        if self.audit_logger:
+            self.audit_logger.log_memory_access(
+                chunk_id=chunk.id,
+                user_id=user_id,
+                action="create",
+                details={"source": source, "layer": target_layer.value if target_layer else "core"},
+            )
+
         return chunk.id
-    
+
+    def add_raw_memory(
+        self,
+        text: str,
+        user_id: str = "default",
+        session_id: Optional[str] = None,
+        importance: float = 0.5,
+        confidence: float = 0.8,
+        check_duplicate: bool = True,
+    ) -> str:
+        """
+        添加原始文本记忆（自动抽取流水线）
+
+        流程：raw_text -> extract_entities -> check_duplicate -> persist
+
+        Args:
+            text: 原始文本
+            user_id: 用户ID
+            session_id: 会话ID
+            importance: 重要性（0-1）
+            confidence: 置信度（0-1）
+            check_duplicate: 是否检查重复
+
+        Returns:
+            记忆ID
+        """
+        from core.entity_extractor import EntityExtractor
+
+        extractor = EntityExtractor()
+
+        # 步骤0：PII 检测与脱敏
+        if self.pii_handler and self.pii_handler.has_pii(text):
+            pii_types = list(self.pii_handler.get_pii_types(text))
+            text = self.pii_handler.redact(text)
+
+            # 记录 PII 检测审计
+            if self.audit_logger:
+                import hashlib
+                text_hash = hashlib.md5(text.encode()).hexdigest()[:16]
+                self.audit_logger.log_pii_detection(
+                    text_hash=text_hash,
+                    pii_types=pii_types,
+                    action="redact",
+                )
+
+        # 步骤1：抽取实体（优先使用 LLM）
+        if self.llm_fn:
+            try:
+                extracted = self._llm_extract(text)
+                persons = set(extracted.get("persons", []))
+
+                # location 可能是字符串或列表
+                location_raw = extracted.get("location")
+                if isinstance(location_raw, list):
+                    location = location_raw[0] if location_raw else None
+                else:
+                    location = location_raw
+
+                time_relative = extracted.get("time")
+                if isinstance(time_relative, list):
+                    time_relative = time_relative[0] if time_relative else None
+                time_context = None
+                time_absolute = None
+                topics = set(extracted.get("topics", []))
+                keywords = set(extracted.get("keywords", []))
+                emotion_valence = float(extracted.get("emotion_valence", 0.0))
+                emotion_intensity = float(extracted.get("emotion_intensity", 0.0))
+
+                # 如果 LLM 返回了 importance，使用它
+                if "importance" in extracted:
+                    importance = float(extracted["importance"])
+
+                print(f"[LLM] 抽取成功: persons={persons}, location={location}, topics={topics}")
+            except Exception as e:
+                print(f"[LLM] 抽取失败，回退到规则抽取: {e}")
+                persons = extractor.extract_persons(text)
+                location = extractor.extract_location(text)
+                time_absolute, time_relative, time_context = extractor.extract_time(text)
+                topics = extractor.extract_topics(text)
+                keywords = extractor.extract_keywords(text)
+                emotion_valence, emotion_intensity = extractor.extract_emotion(text)
+        else:
+            persons = extractor.extract_persons(text)
+            location = extractor.extract_location(text)
+            time_absolute, time_relative, time_context = extractor.extract_time(text)
+            topics = extractor.extract_topics(text)
+            keywords = extractor.extract_keywords(text)
+            emotion_valence, emotion_intensity = extractor.extract_emotion(text)
+
+        # 步骤2：检查重复（如果启用）
+        if check_duplicate:
+            existing = self._find_similar_memory(text)
+            if existing:
+                # 更新现有记忆的访问统计
+                existing.access()
+                existing.successful_recall()
+                existing.version += 1
+                existing.updated_at = time.time()
+                self.core._store.put(existing)
+
+                # 记录更新审计
+                if self.audit_logger:
+                    self.audit_logger.log_memory_access(
+                        chunk_id=existing.id,
+                        user_id=user_id,
+                        action="update",
+                        details={"reason": "duplicate_detected"},
+                    )
+
+                return existing.id
+
+        # 步骤3：创建新记忆
+        chunk = MemoryChunk(
+            content=text,
+            memory_type=MemoryType.INTERACTION,
+
+            persons=persons,
+            location=location,
+            time_absolute=time_absolute,
+            time_relative=time_relative,
+            time_context=time_context,
+            topics=topics,
+            keywords=keywords,
+
+            emotion_valence=emotion_valence,
+            emotion_intensity=emotion_intensity,
+
+            importance=importance,
+
+            # 新增字段
+            source="system_extract",
+            confidence=confidence,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+        # 步骤4：存储
+        self.core.add(chunk)
+
+        # 记录创建审计
+        if self.audit_logger:
+            self.audit_logger.log_memory_access(
+                chunk_id=chunk.id,
+                user_id=user_id,
+                action="create",
+                details={"source": "system_extract"},
+            )
+
+        return chunk.id
+
+    def _find_similar_memory(self, text: str, threshold: float = 0.7):
+        """
+        查找相似记忆（简单实现：基于关键词重叠）
+
+        Args:
+            text: 要查找的文本
+            threshold: 相似度阈值
+
+        Returns:
+            相似的 MemoryChunk 或 None
+        """
+        from core.entity_extractor import EntityExtractor
+
+        extractor = EntityExtractor()
+        new_keywords = extractor.extract_keywords(text)
+
+        if not new_keywords:
+            return None
+
+        # 遍历核心层记忆（get_all 返回 Dict[str, MemoryChunk]）
+        for chunk in self.core._store.get_all().values():
+            existing_keywords = chunk.keywords
+            if not existing_keywords:
+                continue
+
+            # 计算关键词重叠率
+            overlap = len(new_keywords & existing_keywords)
+            total = len(new_keywords | existing_keywords)
+            similarity = overlap / total if total > 0 else 0
+
+            if similarity >= threshold:
+                return chunk
+
+        return None
+
+    def _llm_extract(self, text: str) -> dict:
+        """
+        使用 LLM 从文本中抽取结构化信息
+
+        Args:
+            text: 输入文本
+
+        Returns:
+            抽取结果字典
+        """
+        prompt = f"""请从以下文本中提取结构化信息，返回 JSON 格式。
+
+要求：
+1. persons: 涉及的人物列表（名字）
+2. location: 地点（如果有）
+3. time: 时间描述（如果有）
+4. topics: 主题标签列表（2-5个）
+5. keywords: 关键词列表（3-8个）
+6. emotion_valence: 情绪效价（-1.0到1.0，负面到正面）
+7. emotion_intensity: 情绪强度（0.0到1.0）
+8. importance: 重要性（0.0到1.0）
+
+文本：{text}
+
+请直接返回 JSON，不要有其他内容："""
+
+        try:
+            result = self.llm_fn(prompt)
+            print(f"[LLM] 原始返回: {result[:200]}...")
+
+            # 尝试解析 JSON
+            import re
+
+            # 移除 markdown 代码块标记
+            result = re.sub(r'```json\s*', '', result)
+            result = re.sub(r'```\s*', '', result)
+
+            # 尝试直接解析
+            try:
+                return json.loads(result.strip())
+            except json.JSONDecodeError:
+                pass
+
+            # 提取 JSON 部分（支持嵌套）
+            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', result, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+
+            # 尝试找到第一个 { 和最后一个 }
+            start = result.find('{')
+            end = result.rfind('}')
+            if start != -1 and end != -1:
+                return json.loads(result[start:end+1])
+
+            return {}
+        except Exception as e:
+            print(f"[LLM] JSON 解析失败: {e}")
+            return {}
+
     def retrieve(
         self,
         query: str,
         allow_forgotten: bool = True,
+        user_id: str = "default",
     ) -> ReconstructionResult:
         """
         检索记忆
-        
+
         返回重组后的记忆
         """
-        return self.retrieval.retrieve(query, allow_forgotten)
+        start_time = time.time()
+        result = self.retrieval.retrieve(query, allow_forgotten)
+        latency = time.time() - start_time
+
+        # 记录检索审计
+        if self.audit_logger:
+            import hashlib
+            query_hash = hashlib.md5(query.encode()).hexdigest()[:16]
+            self.audit_logger.log_retrieval(
+                user_id=user_id,
+                query_hash=query_hash,
+                num_results=len(result.chunks),
+                latency=latency,
+            )
+
+        return result
     
     def retrieve_by_photo(
         self,

@@ -28,80 +28,99 @@ class MemoryLayer(Enum):
 class MemoryChunk:
     """
     记忆碎片
-    
+
     设计原则：
     - content 是实际记忆内容
     - tags 是元信息（头文件），用于检索
     - layer 标记当前所在层级
     - memory_type 影响权重衰减策略
     """
-    
+
     # 唯一标识
     id: str = field(default_factory=lambda: f"mem_{uuid.uuid4().hex[:12]}")
-    
+
     # 记忆内容
     content: str = ""
-    
+
     # 摘要（用于索引和快速检索）
     summary: str = ""
-    
+
     # 记忆类型（影响衰减节奏）
     memory_type: MemoryType = MemoryType.INTERACTION
-    
+
     # 多维标签（头文件）
     tags: Dict[str, Any] = field(default_factory=dict)
-    
+
     # 时间维度
     time_absolute: Optional[str] = None   # 绝对时间："2026-04-29"
     time_relative: Optional[str] = None   # 相对时间："10年前", "上周", "中午"
     time_context: Optional[str] = None    # 时间上下文："工作日", "假期", "出差"
-    
+
     # 空间维度
     location: Optional[str] = None        # 地点标签
     location_detail: Optional[str] = None # 地点细节
-    
+
     # 人物维度
     persons: Set[str] = field(default_factory=set)  # 涉及的人物
     person_count: int = 1
-    
+
     # 主题/语义维度
     topics: Set[str] = field(default_factory=set)  # 主题标签
     keywords: Set[str] = field(default_factory=set)  # 关键词
-    
+
     # 情绪维度
     emotion_valence: float = 0.0   # 情绪效价 -1.0(负面) ~ +1.0(正面)
     emotion_intensity: float = 0.0 # 情绪强度 0.0 ~ 1.0
     emotion_tags: Set[str] = field(default_factory=set)  # 情绪标签列表
-    
+
     # 连接价值
     connection_value: float = 0.5  # 能触发多少其他记忆
-    
+
     # 重要性（用户对这件事的长期重视程度，0~1）
     importance: float = 0.5
-    
+
     # 层级
     layer: MemoryLayer = MemoryLayer.CORE
-    
+
     # 时间戳
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
-    
+
     # 访问统计
     access_count: int = 0
     successful_recall_count: int = 0  # 成功被唤醒次数
-    
+
     # 关联记忆（Hebbian关联）
     associations: Dict[str, float] = field(default_factory=dict)  # chunk_id -> weight
-    
+
     # 审阅标记
     review_status: str = "pending"  # pending / approved / questionable / rejected
     review_note: Optional[str] = None
-    
+
     # 重建相关
     reconstruction_count: int = 0   # 被重建过的次数
     parent_id: Optional[str] = None  # 如果是从旧版本重建的，记录原记忆ID
-    
+
+    # ===== 新增：统一 schema 字段 =====
+
+    # 记忆来源
+    source: str = "user"  # user / system_extract / import / consolidation
+
+    # 置信度（这条记忆有多可信，0~1）
+    confidence: float = 0.8
+
+    # 有效期（事实可能过时）
+    valid_at: Optional[float] = None    # 有效期开始时间戳
+    invalid_at: Optional[float] = None  # 有效期结束时间戳（None 表示永不过期）
+
+    # 用户与会话标识
+    user_id: str = "default"      # 用户ID（多用户隔离）
+    session_id: Optional[str] = None  # 会话ID（跨会话追踪）
+
+    # 版本控制
+    version: int = 1  # 版本号，更新时递增
+
     # 元数据（扩展字段）
     metadata: Dict[str, Any] = field(default_factory=dict)
     
@@ -238,6 +257,14 @@ class MemoryChunk:
             "review_note": self.review_note,
             "reconstruction_count": self.reconstruction_count,
             "parent_id": self.parent_id,
+            # 新增字段
+            "source": self.source,
+            "confidence": self.confidence,
+            "valid_at": self.valid_at,
+            "invalid_at": self.invalid_at,
+            "user_id": self.user_id,
+            "session_id": self.session_id,
+            "version": self.version,
             "metadata": self.metadata,
         }
     

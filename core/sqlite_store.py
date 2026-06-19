@@ -90,7 +90,14 @@ class SqliteMemoryStore(MemoryStore):
                 review_note TEXT,
                 reconstruction_count INTEGER DEFAULT 0,
                 parent_id TEXT,
-                metadata TEXT DEFAULT '{{}}'
+                metadata TEXT DEFAULT '{{}}',
+                source TEXT DEFAULT 'user',
+                confidence REAL DEFAULT 0.8,
+                valid_at REAL,
+                invalid_at REAL,
+                user_id TEXT DEFAULT 'default',
+                session_id TEXT,
+                version INTEGER DEFAULT 1
             )
         """)
 
@@ -112,7 +119,31 @@ class SqliteMemoryStore(MemoryStore):
             )
         """)
 
+        # 添加新列（如果不存在）- 支持旧数据库升级
+        self._migrate_add_columns(t)
+
         self.conn.commit()
+
+    def _migrate_add_columns(self, t):
+        """添加新列到现有表（如果不存在）"""
+        # 获取现有列名
+        cursor = self.conn.execute(f"PRAGMA table_info({t('memory_chunks')})")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        # 需要添加的新列
+        new_columns = [
+            ("source", "TEXT DEFAULT 'user'"),
+            ("confidence", "REAL DEFAULT 0.8"),
+            ("valid_at", "REAL"),
+            ("invalid_at", "REAL"),
+            ("user_id", "TEXT DEFAULT 'default'"),
+            ("session_id", "TEXT"),
+            ("version", "INTEGER DEFAULT 1"),
+        ]
+
+        for col_name, col_def in new_columns:
+            if col_name not in existing_columns:
+                self.conn.execute(f"ALTER TABLE {t('memory_chunks')} ADD COLUMN {col_name} {col_def}")
 
     def put(self, chunk: MemoryChunk) -> None:
         """存储一个记忆碎片"""
@@ -133,7 +164,9 @@ class SqliteMemoryStore(MemoryStore):
                 created_at, updated_at, last_accessed,
                 access_count, successful_recall_count,
                 associations, review_status, review_note,
-                reconstruction_count, parent_id, metadata
+                reconstruction_count, parent_id, metadata,
+                source, confidence, valid_at, invalid_at,
+                user_id, session_id, version
             ) VALUES (
                 :id, :layer, :content, :summary, :memory_type, :tags,
                 :time_absolute, :time_relative, :time_context,
@@ -144,7 +177,9 @@ class SqliteMemoryStore(MemoryStore):
                 :created_at, :updated_at, :last_accessed,
                 :access_count, :successful_recall_count,
                 :associations, :review_status, :review_note,
-                :reconstruction_count, :parent_id, :metadata
+                :reconstruction_count, :parent_id, :metadata,
+                :source, :confidence, :valid_at, :invalid_at,
+                :user_id, :session_id, :version
             )
         """, {
             "id": d["id"],
@@ -178,6 +213,14 @@ class SqliteMemoryStore(MemoryStore):
             "reconstruction_count": d.get("reconstruction_count", 0),
             "parent_id": d.get("parent_id"),
             "metadata": json.dumps(d.get("metadata", {}), ensure_ascii=False),
+            # 新增字段
+            "source": d.get("source", "user"),
+            "confidence": d.get("confidence", 0.8),
+            "valid_at": d.get("valid_at"),
+            "invalid_at": d.get("invalid_at"),
+            "user_id": d.get("user_id", "default"),
+            "session_id": d.get("session_id"),
+            "version": d.get("version", 1),
         })
 
         # 更新倒排索引
@@ -306,8 +349,10 @@ class SqliteMemoryStore(MemoryStore):
         self._ensure_connection()
 
         t = self._table
+        # 如果 index_name 已经以 _idx 结尾，直接使用；否则添加 _idx 后缀
+        table_name = index_name if index_name.endswith('_idx') else index_name + '_idx'
         cursor = self.conn.execute(
-            f"SELECT chunk_id FROM {t(index_name + '_idx')} WHERE key = ?",
+            f"SELECT chunk_id FROM {t(table_name)} WHERE key = ?",
             (key,)
         )
         return {row[0] for row in cursor}
