@@ -21,6 +21,7 @@ from core.cognitive_runtime import (
 )
 from core.llm_planner import (
     LLMCallable,
+    LLMError,
     LLMPlanner,
     LLMPlannerConfig,
     LLMResponseSynthesizer,
@@ -61,6 +62,7 @@ __all__ = [
     "FocusWorkspace",
     "Goal",
     "LLMCallable",
+    "LLMError",
     "LLMPlanner",
     "LLMPlannerConfig",
     "LLMRuntimeFinalizer",
