@@ -8,7 +8,6 @@ messages and prints them to stdout.
 from __future__ import annotations
 
 import argparse
-import sys
 import threading
 from typing import Any
 

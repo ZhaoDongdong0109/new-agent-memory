@@ -8,7 +8,7 @@ ContextCompressor - 短期上下文压缩器
 4. 生成结构化摘要
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 
 class ContextCompressor:

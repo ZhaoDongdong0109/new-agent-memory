@@ -8,7 +8,6 @@
 """
 
 import random
-import math
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
 
@@ -266,7 +265,7 @@ if __name__ == "__main__":
         result = engine.infer_emotion(test_text)
         print(f"  第{i+1}次采样: {result.emotion_tag}, 系数={result.coefficient:.3f}")
     
-    print(f"\n[2] 不同文本的情绪推断...")
+    print("\n[2] 不同文本的情绪推断...")
     for text in test_texts:
         result = engine.infer_emotion(text)
         print(f"  文本: {text[:20]}...")
@@ -279,7 +278,7 @@ if __name__ == "__main__":
     
     hint = engine.get_calibration_hint("焦虑")
     if hint:
-        print(f"  检测到系统对'焦虑'情绪持续低估")
+        print("  检测到系统对'焦虑'情绪持续低估")
         print(f"  平均偏差: {hint['avg_bias']:.3f}")
         print(f"  建议调整: {hint['suggested_adjustment']:.3f}")
     

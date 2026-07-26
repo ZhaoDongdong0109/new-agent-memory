@@ -22,7 +22,6 @@
 """
 
 import time
-import uuid
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from enum import Enum
@@ -366,7 +365,6 @@ class PersonaLayer:
 # ============ 测试 ============
 
 if __name__ == "__main__":
-    import random
     
     print("=" * 60)
     print("人格适应层 - 测试")

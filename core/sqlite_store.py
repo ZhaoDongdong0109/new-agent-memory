@@ -11,10 +11,9 @@ SQLite 存储后端
 import json
 import os
 import sqlite3
-import time
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, Optional, Set
 
-from core.store import MemoryStore, IndexStore
+from core.store import MemoryStore
 from memory_chunk import MemoryChunk, MemoryLayer, MemoryType
 
 

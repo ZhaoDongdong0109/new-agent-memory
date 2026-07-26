@@ -15,7 +15,6 @@
 """
 
 import math
-import random
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -23,7 +22,7 @@ from typing import Dict, Set, Optional, List, Any
 from enum import Enum
 
 # 导入情绪引擎
-from core.emotion_engine import EmotionEngine, EmotionResult
+from core.emotion_engine import EmotionEngine
 
 
 class MemoryType(Enum):
