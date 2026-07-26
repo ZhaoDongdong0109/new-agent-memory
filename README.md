@@ -1,6 +1,18 @@
 # new-agent-memory
 
-Explainable human-like memory layer for AI agents.
+**Explainable human-like memory for AI agents** — power-law forgetting (ACT-R),
+cue-based reawakening, bi-temporal fact supersession, associative recall
+(Personalized PageRank), and deterministic sleep consolidation. Zero runtime
+dependencies; every weight, wake and decision has an auditable trace.
+
+```bash
+pip install new-agent-memory
+```
+
+Ships with an MCP server exposing the full cognitive surface
+(`memory_search / add / explain / history / sleep / focus / feedback`) —
+plug it into Claude Code and give your agent a brain that remembers,
+forgets, and can always tell you why.
 
 `new-agent-memory` 是一个探索类人长期记忆的 Python 原型。它不只是把所有内容塞进向量库，而是把记忆分成核心层和伪遗忘层，让记忆可以被强化、衰减、降级，并在合适的线索出现时重新唤醒。
 
