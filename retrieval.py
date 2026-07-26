@@ -476,15 +476,27 @@ class MemoryRetrieval:
                     ),
                 )
 
-        # Step 3.5: 联想回忆（扩散激活）
-        # 由命中记忆沿 Hebbian 关联图扩散激活，把"因为想起 A 而想起 B"
-        # 变成真实行为；被强激活的归档记忆会被联想唤醒甚至提升。
+        # Step 3.5: 联想回忆（PPR 扩散激活）
+        # 由命中记忆沿 概念隶属 + Hebbian 关联图扩散，把"因为想起 A
+        # 而想起 B"变成真实行为；被强激活的归档记忆会被联想唤醒甚至提升。
+        #
+        # 联想追加的结果必须通过与主结果相同的时态/时间窗口过滤——
+        # 否则被窗口/失效过滤排除的记忆会从联想这条后门溜回结果。
         associated = self._associative_recall(all_chunks, allow_forgotten=allow_forgotten)
         seen_ids = {c.id for c in all_chunks}
         for c in associated:
-            if c.id not in seen_ids:
-                all_chunks.append(c)
-                seen_ids.add(c.id)
+            if c.id in seen_ids:
+                continue
+            if ctx.tense != "past" and c.invalid_at is not None and c.invalid_at <= now:
+                continue
+            if ctx.time_window:
+                from core.time_parser import chunk_time_range, windows_overlap
+                if not windows_overlap(chunk_time_range(c), ctx.time_window) and not (
+                    ctx.time_relative and ctx.time_relative in (c.time_relative, c.time_context)
+                ):
+                    continue
+            all_chunks.append(c)
+            seen_ids.add(c.id)
 
         # Step 4: 组装
         assembled = self._assemble(all_chunks, ctx)
@@ -525,78 +537,164 @@ class MemoryRetrieval:
         
         return result
     
+    # PPR 子图规模上限（确定性截断，防止大库上的构图开销失控）
+    _PPR_MAX_CONCEPT_MEMBERS = 20   # 每个概念节点纳入的成员数上限
+    _PPR_MAX_EDGES_PER_CHUNK = 10   # 每条记忆纳入的 Hebbian 边上限
+    _PPR_MAX_NODES = 300            # 子图节点总数上限
+
     def _associative_recall(
         self,
         seed_chunks: List[MemoryChunk],
-        max_hops: int = 2,
-        hop_decay: float = 0.5,
-        edge_fanout: int = 5,
+        damping: float = 0.5,
+        max_iterations: int = 20,
+        convergence_eps: float = 1e-6,
+        activation_gain: float = 3.0,
         activation_threshold: float = 0.15,
         limit: int = 5,
         allow_forgotten: bool = True,
     ) -> List[MemoryChunk]:
         """
-        扩散激活联想回忆（spreading activation）。
+        Personalized PageRank 联想回忆（HippoRAG 的海马体索引思想，
+        确定性幂迭代实现）。
 
-        命中的记忆作为激活源（activation=1.0），激活沿 Hebbian 关联边
-        传播：contribution = 源激活 × 边权 × hop_decay，逐跳衰减，
-        每个节点的激活为累积贡献（封顶 1.0）。
+        图结构（按需从种子邻域构建）：
+        - 记忆节点：种子 + 概念成员 + Hebbian 邻居
+        - 概念节点：种子记忆携带的人物/主题/地点标签（新皮层-海马体
+          的双向投射：两条记忆即使没有显式 Hebbian 边，共享"老王"
+          也会通过概念节点变成两跳邻居）
+        - 边权：概念隶属 1.0，Hebbian 边取存储的权重
 
-        与人类回忆一致的三个性质：
-        1. 联想距离越远、连接越弱，被想起的概率越低（逐跳 × 边权衰减）
-        2. 多条路径汇聚的记忆更容易被想起（贡献累积）
-        3. 关联本身是唤醒线索——被强激活的归档记忆会被联想唤醒，
-           激活足够强时直接提升回核心层（"想起 A 时把尘封的 B 也带回来了"）
+        p = (1-d)·r + d·Wᵀp，restart 质量均分在种子上，
+        列归一化的 Wᵀ 天然实现扇出阻尼（ACT-R fan effect）：
+        连接 50 条记忆的常见概念每条只分到 1/50 的质量，
+        稀有线索的联想强度远高于烂大街的线索。
 
-        激活轨迹保存在 self.last_activation_trace，便于审计解释
-        "为什么这条记忆出现在结果里"。
+        相比旧的固定跳数扩散激活：多路径汇聚由平稳分布原理性处理
+        （不存在重复传播类缺陷），任意深度传播自动收敛，无需 hop 上限。
+
+        校准锚点（activation = gain × p / max(种子 p)）：
+        - 单条 0.8 强 Hebbian 边 -> ~0.4：召回且可提升归档记忆（>=0.25）
+        - 单条 0.1 弱边 -> ~0.07：低于收录阈值（<0.15），联想有选择性
+        - 归档记忆只能经 Hebbian 边进入子图，概念隶属不桥接归档层
+          （伪遗忘层不参与主动检索的原则不变）
+
+        激活轨迹保存在 self.last_activation_trace，便于审计解释。
         """
         if not seed_chunks:
             return []
 
-        activation: Dict[str, float] = {c.id: 1.0 for c in seed_chunks}
-        seed_ids = set(activation.keys())
-        # 非种子节点：id -> chunk
-        collected: Dict[str, MemoryChunk] = {}
+        seed_ids = {c.id for c in seed_chunks}
 
-        # frontier 以 id 去重：同一节点在一跳内被多条路径激活时，
-        # 贡献已在 activation 中累积，但它本身只应向外传播一次——
-        # 重复的 frontier 条目会造成重复传播，人为放大下游激活，
-        # 进而错误触发归档记忆的提升。
-        frontier: Dict[str, MemoryChunk] = {c.id: c for c in seed_chunks}
-        for _hop in range(max_hops):
-            next_frontier: Dict[str, MemoryChunk] = {}
-            # 排序保证传播顺序确定，结果可复现
-            for src_id, src_chunk in sorted(
-                frontier.items(), key=lambda x: (-activation[x[0]], x[0])
-            ):
-                src_act = activation[src_id]
-                if not src_chunk.associations:
+        # ---------- 构建种子邻域子图 ----------
+        # 节点 id 约定：记忆节点用 chunk.id，概念节点用 "concept::<tag>"
+        chunks_in_graph: Dict[str, MemoryChunk] = {c.id: c for c in seed_chunks}
+        edges: Dict[str, Dict[str, float]] = {}
+
+        def _add_edge(a: str, b: str, weight: float):
+            edges.setdefault(a, {})[b] = max(edges.get(a, {}).get(b, 0.0), weight)
+            edges.setdefault(b, {})[a] = max(edges.get(b, {}).get(a, 0.0), weight)
+
+        def _concept_members(index: Dict[str, set], tag: str) -> List[str]:
+            bucket = index.get(tag, set())
+            return sorted(bucket)[: self._PPR_MAX_CONCEPT_MEMBERS]
+
+        def _include_chunk(chunk_id: str) -> Optional[MemoryChunk]:
+            if chunk_id in chunks_in_graph:
+                return chunks_in_graph[chunk_id]
+            if len(chunks_in_graph) >= self._PPR_MAX_NODES:
+                return None
+            target = self.core.get(chunk_id)
+            if target is None and allow_forgotten:
+                # 归档记忆只能经 Hebbian 边进入（调用方控制）
+                target = self.forgotten.get(chunk_id)
+            if target is not None:
+                chunks_in_graph[chunk_id] = target
+            return target
+
+        # 第一层：种子的概念隶属 + Hebbian 边
+        frontier_ids = list(seed_ids)
+        for _depth in range(2):
+            next_frontier: List[str] = []
+            for cid in sorted(frontier_ids):
+                chunk = chunks_in_graph.get(cid)
+                if chunk is None:
                     continue
-                edges = sorted(
-                    src_chunk.associations.items(),
-                    key=lambda x: (-x[1], x[0]),
-                )[:edge_fanout]
-                for assoc_id, edge_weight in edges:
-                    contribution = src_act * edge_weight * hop_decay
-                    if contribution < 0.02:
+
+                # 概念隶属边（只对核心层记忆展开成员——
+                # 伪遗忘层不通过概念参与主动联想）
+                if chunk.layer == MemoryLayer.CORE:
+                    concept_specs = (
+                        [("person", p, self.core.person_index) for p in sorted(chunk.persons)]
+                        + [("topic", t, self.core.topic_index) for t in sorted(chunk.topics)]
+                        + ([("location", chunk.location, self.core.location_index)]
+                           if chunk.location else [])
+                    )
+                    for kind, tag, index in concept_specs:
+                        concept_node = f"concept::{kind}::{tag}"
+                        _add_edge(cid, concept_node, 1.0)
+                        for member_id in _concept_members(index, tag):
+                            if member_id == cid:
+                                continue
+                            member = _include_chunk(member_id)
+                            if member is not None:
+                                _add_edge(concept_node, member_id, 1.0)
+                                next_frontier.append(member_id)
+
+                # Hebbian 边（可通向归档记忆——关联本身是唤醒线索）
+                hebbian = sorted(
+                    chunk.associations.items(), key=lambda x: (-x[1], x[0]),
+                )[: self._PPR_MAX_EDGES_PER_CHUNK]
+                for assoc_id, weight in hebbian:
+                    if weight <= 0.0:
                         continue
                     target = self.core.get(assoc_id)
-                    if target is None and allow_forgotten:
-                        # 只有允许触碰伪遗忘层时才把归档记忆纳入联想
+                    if target is None:
+                        if not allow_forgotten:
+                            continue
                         target = self.forgotten.get(assoc_id)
                     if target is None:
                         continue
-                    new_act = min(1.0, activation.get(assoc_id, 0.0) + contribution)
-                    if new_act <= activation.get(assoc_id, 0.0):
-                        continue
-                    activation[assoc_id] = new_act
-                    if assoc_id not in seed_ids:
-                        collected[assoc_id] = target
-                    next_frontier[assoc_id] = target
-            frontier = next_frontier
-            if not frontier:
+                    if assoc_id not in chunks_in_graph:
+                        if len(chunks_in_graph) >= self._PPR_MAX_NODES:
+                            continue
+                        chunks_in_graph[assoc_id] = target
+                    _add_edge(cid, assoc_id, weight)
+                    next_frontier.append(assoc_id)
+            frontier_ids = [i for i in next_frontier if i not in seed_ids]
+
+        # ---------- 幂迭代 ----------
+        nodes = sorted(edges.keys() | chunks_in_graph.keys())
+        restart = {n: (1.0 / len(seed_ids) if n in seed_ids else 0.0) for n in nodes}
+        # 列归一化：每个节点向外推送的质量按边权比例分配
+        out_weight = {n: sum(edges.get(n, {}).values()) for n in nodes}
+
+        p = dict(restart)
+        for _ in range(max_iterations):
+            nxt = {n: (1.0 - damping) * restart[n] for n in nodes}
+            for src in nodes:
+                mass = p[src]
+                total = out_weight[src]
+                if mass <= 0.0 or total <= 0.0:
+                    continue
+                for dst, weight in edges.get(src, {}).items():
+                    nxt[dst] += damping * mass * (weight / total)
+            delta = sum(abs(nxt[n] - p[n]) for n in nodes)
+            p = nxt
+            if delta < convergence_eps:
                 break
+
+        # ---------- 激活换算（相对种子平稳质量） ----------
+        max_seed_mass = max((p.get(sid, 0.0) for sid in seed_ids), default=0.0)
+        collected: Dict[str, MemoryChunk] = {}
+        activation: Dict[str, float] = {}
+        if max_seed_mass > 0:
+            for cid, chunk in chunks_in_graph.items():
+                if cid in seed_ids:
+                    continue
+                act = min(1.0, activation_gain * p.get(cid, 0.0) / max_seed_mass)
+                if act > 0.0:
+                    activation[cid] = act
+                    collected[cid] = chunk
 
         # 审计轨迹（只记录非种子的联想激活）
         self.last_activation_trace = sorted(
