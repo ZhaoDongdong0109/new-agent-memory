@@ -122,35 +122,51 @@ def test_user_deletion_purges_hybrid_index(tmp_path):
     assert all(system.core.get(cid) is not None for cid in ids)
 
 
-# ============ 5. 扩散激活不得重复传播 ============
+# ============ 5. 联想激活的收敛性质（PPR 幂迭代） ============
 
-def test_no_double_propagation(tmp_path):
-    """同一节点被多路径激活后，只向外传播一次（激活值可精确预测）"""
-    system = _make_system(tmp_path, enable_hybrid_retrieval=False)
-    id_a1 = system.add_memory(content="种子甲", topics=["旅行"], persons=["老王"])
-    id_a2 = system.add_memory(content="种子乙", topics=["旅行"], persons=["老王"])
-    id_b = system.add_memory(content="中间节点", topics=["天气"])
-    id_c = system.add_memory(content="末端节点", topics=["天气"])
+def test_convergent_multipath_activation_is_principled(tmp_path):
+    """
+    多路径汇聚由 PPR 平稳分布原理性处理：
+    1. 完全确定（同图同种子 -> 同激活轨迹）
+    2. 随距离衰减（两跳 < 一跳）
+    3. 汇聚不失控：弱连接的归档记忆不会因多路径膨胀被错误提升
+       （即原审查确认的"重复传播导致过度提升"缺陷类别）
+    """
+    def build(tmp):
+        system = _make_system(tmp, enable_hybrid_retrieval=False)
+        id_a1 = system.add_memory(content="种子甲", topics=["旅行"], persons=["老王"])
+        id_a2 = system.add_memory(content="种子乙", topics=["旅行"], persons=["老王"])
+        id_b = system.add_memory(content="中间节点", topics=["天气"])
+        id_g = system.add_memory(content="末端归档", topics=["装备"])
+        system.core.strengthen_association(id_a1, id_b, strength=0.5)
+        system.core.strengthen_association(id_a2, id_b, strength=0.5)
+        system.core.strengthen_association(id_b, id_g, strength=0.9)
+        chunk_g = system.core.remove(id_g)
+        system.forgotten.archive(chunk_g)
+        return system, id_b, id_g
 
-    # 两条路径汇入 B，B 再连 C
-    system.core.strengthen_association(id_a1, id_b, strength=0.5)
-    system.core.strengthen_association(id_a2, id_b, strength=0.5)
-    system.core.strengthen_association(id_b, id_c, strength=0.9)
-    # strengthen 是饱和递增的，读出实际边权用于精确断言
-    w_a1b = system.core.get(id_a1).associations[id_b]
-    w_bc = system.core.get(id_b).associations[id_c]
-
+    system, id_b, id_g = build(tmp_path / "run1")
     result = system.retrieve("和老王一起去的旅行")
     assert result.success
     trace = dict(system.retrieval.last_activation_trace)
 
-    # B 的激活 = 两路贡献之和；C = B 单次传播
-    expected_b = min(1.0, w_a1b * 0.5 * 2)
-    expected_c = expected_b * w_bc * 0.5
-    assert trace[id_b] == pytest.approx(expected_b, abs=1e-6)
-    assert trace.get(id_c, 0.0) == pytest.approx(expected_c, abs=1e-6), (
-        "C 的激活高于单次传播的预测值——B 重复传播了"
+    # 性质 2：衰减排序——两跳末端弱于一跳中间节点
+    assert trace[id_b] > trace.get(id_g, 0.0), "激活未随联想距离衰减"
+
+    # 性质 3：汇聚不失控——弱连接（仅经一条两跳路径可达）的归档
+    # 记忆不得跨过提升阈值（旧缺陷：重复传播把它膨胀过线）
+    assert system.forgotten.get(id_g) is not None, (
+        "弱连接归档记忆被多路径膨胀错误提升"
     )
+    assert system.core.get(id_g) is None
+
+    # 性质 1：完全确定性——独立重建同一拓扑，激活值逐位一致
+    system2, id_b2, id_g2 = build(tmp_path / "run2")
+    result2 = system2.retrieve("和老王一起去的旅行")
+    assert result2.success
+    trace2 = dict(system2.retrieval.last_activation_trace)
+    assert trace[id_b] == pytest.approx(trace2[id_b2], abs=1e-12)
+    assert trace.get(id_g, 0.0) == pytest.approx(trace2.get(id_g2, 0.0), abs=1e-12)
 
 
 # ============ 6. allow_forgotten=False 约束联想唤醒 ============

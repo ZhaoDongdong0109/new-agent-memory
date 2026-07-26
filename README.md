@@ -523,19 +523,27 @@ FACT / PREFERENCE 记忆的写入经过确定性决策表（`core/supersession.p
 
 ### Associative Recall（联想回忆）
 
-检索命中之后还有一步扩散激活（spreading activation）：
+检索命中之后还有一步 **Personalized PageRank** 扩散（HippoRAG 的
+海马体索引思想，确定性幂迭代实现）：
 
 ```text
-命中记忆（activation = 1.0）
-  -> 沿 Hebbian 关联边传播：contribution = 激活 × 边权 × 0.5/跳
-  -> 多路径汇聚的记忆激活累积（更容易被想起）
-  -> 强激活的归档记忆被联想唤醒，甚至提升回核心层
+命中记忆作为 restart 种子
+  -> 子图：记忆节点 + 概念节点（人物/主题/地点）
+     概念隶属边 1.0，Hebbian 边取存储权重
+  -> p = (1-d)·r + d·Wᵀp 迭代至收敛（d=0.5，<=20 轮）
+  -> 平稳质量即联想激活；强激活的归档记忆被唤醒甚至提升回核心层
 ```
 
-关联图的生长途径是检索时的 Hebbian 共激活：同一次检索里一起出现的
-记忆互相连线（fire together, wire together）。这让系统表现出
-"因为想起 A 而想起 B"，包括把尘封在伪遗忘层的 B 一并带回来。
-每次联想都有激活轨迹审计（`retrieval.last_activation_trace`）。
+概念节点是关键：两条记忆即使没有显式关联边，共享"老王"也会通过
+概念节点成为两跳邻居（概念桥接）。列归一化天然实现 ACT-R 扇出
+效应——连接 50 条记忆的常见概念每条只分到 1/50 质量，稀有线索的
+联想远强于烂大街的线索。多路径汇聚由平稳分布原理性处理，任意
+深度传播自动收敛。
+
+关联图的另一条生长途径是检索时的 Hebbian 共激活：同一次检索里
+一起出现的记忆互相连线（fire together, wire together）。归档记忆
+只能经 Hebbian 边进入联想子图——伪遗忘层不参与主动检索的原则
+不变。每次联想都有激活轨迹审计（`retrieval.last_activation_trace`）。
 
 ## Attention Model
 
@@ -611,7 +619,7 @@ python -m compileall .
 - [x] SQLite 持久化后端
 - [x] 向量检索 / BM25 / RRF 混合检索（已接入生产检索路径）
 - [x] 遗忘-唤醒生命周期闭环（降级 → 线索唤醒 → 提升回核心层）
-- [x] 联想回忆：Hebbian 共激活 + 扩散激活 + 联想唤醒归档记忆
+- [x] 联想回忆：Hebbian 共激活 + PPR 概念图扩散 + 联想唤醒归档记忆
 - [x] 双时态事实取代：ADD/UPDATE/SUPERSEDE/NOOP 确定性决策表
 - [x] 时间感知检索：确定性时间表达解析 + 窗口过滤 + 时态路由
 - [x] 可审计弃答：窗口外/已过时的结果不冒充答案
@@ -621,7 +629,7 @@ python -m compileall .
 - [x] ACT-R 基线激活方程替换手调权重因子（研究议程 #5，Petrov O(k) 近似）
 - [ ] Pavlik 激活依赖衰减扩展（间隔效应，需按次衰减状态）
 - [x] 确定性睡眠周期：优先回放的情景→语义巩固（研究议程 #7，session-rollup 切片）
-- [ ] Personalized PageRank 联想回忆 + 扇出效应阻尼（研究议程 #6，HippoRAG）
+- [x] Personalized PageRank 联想回忆 + 扇出阻尼（研究议程 #6，HippoRAG 海马体索引）
 - [ ] 睡眠周期第二切片：当前值槽索引 + 槽内乱序矛盾重扫 + MCP 维护工具
 - [ ] 要点支持计数：后续匹配情景增强既有要点而非重复抽象
 - [ ] 经验复盘 `ConsolidationEngine` 接入 Agent 主循环
