@@ -94,6 +94,30 @@ ACTR_DECAY_BY_TYPE = {
 ACTR_THRESHOLD = -5.5
 ACTR_NOISE_SCALE = 1.0
 
+# ============ Pavlik & Anderson (2005) 间隔效应 ============
+#
+# 朴素 BLA 的盲区：每次使用贡献相同的痕迹，突击复习 5 次与
+# 分散复习 5 次编码强度一样——与 100 年的间隔效应实证相悖。
+# Pavlik & Anderson 的扩展：每次使用事件的衰减速率取决于
+# 复习瞬间的激活水平：
+#
+#   d_j = c * e^(m_j) + α        m_j = 第 j 次使用时的激活 B
+#
+# 激活很高时复习（刚用过就再用）-> 该次痕迹衰减快，边际收益小；
+# 激活接近阈值时复习（快忘了才复习）-> 痕迹接近基线衰减，最耐久。
+#
+# 本移植取 α = 类型基线 d（保持既有单事件校准锚点不动：首次
+# 编码前激活为 -inf，e^(-inf)=0，d_0 = 类型 d），c 沿用论文
+# 拟合值 0.277。上限 0.95 保证幂律积分收敛。
+PAVLIK_SPACING_C = 0.277
+PAVLIK_DECAY_CEIL = 0.95
+
+
+def pavlik_event_decay(activation: float, base_d: float) -> float:
+    """某次使用事件的衰减速率：复习时激活越高，该次痕迹越易衰减"""
+    import math
+    return min(PAVLIK_DECAY_CEIL, base_d + PAVLIK_SPACING_C * math.exp(activation))
+
 
 def actr_decay(memory_type) -> float:
     """返回某个记忆类型的 ACT-R 衰减速率 d。容忍字符串值。"""

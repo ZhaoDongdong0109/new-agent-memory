@@ -82,10 +82,11 @@ class MemoryChunk:
     # 层级
     layer: MemoryLayer = MemoryLayer.CORE
 
-    # 时间戳
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
-    last_accessed: float = field(default_factory=time.time)
+    # 时间戳（lambda 晚绑定 time.time：默认工厂在类定义时捕获的是
+    # 模块属性查找而非函数对象，测试注入冻结时钟才会对创建生效）
+    created_at: float = field(default_factory=lambda: time.time())
+    updated_at: float = field(default_factory=lambda: time.time())
+    last_accessed: float = field(default_factory=lambda: time.time())
 
     # 访问统计
     access_count: int = 0
@@ -100,6 +101,20 @@ class MemoryChunk:
     # 精确保留最近 ACCESS_LOG_SIZE 次，更早的次数由 access_count
     # 统计近似）。编码事件（创建）算第一次使用。
     access_log: list = field(default_factory=list)
+
+    # 每次使用事件的衰减速率（Pavlik & Anderson 2005 间隔效应：
+    # 复习时激活越高，该次痕迹衰减越快——突击复习不如分散复习）。
+    # 与 access_log 右对齐（最近的事件在尾部）；缺失/None 的事件
+    # 用类型基线衰减 d。由 MemoryLayerCore.access() 在记录访问时
+    # 根据当时的激活水平写入。
+    access_decays: list = field(default_factory=list)
+
+    # 被裁剪出 access_log 的事件的衰减速率滑动累计（对抗审查实测：
+    # 尾部积分若用类型基线 d，密集复习把事件推入尾部即逃脱间隔
+    # 惩罚——20 次突击后 91% 的激活和来自未受罚的尾部，间隔惩罚
+    # 恰好在最该生效的场景失效）。尾部积分用该均值作指数。
+    evicted_decay_sum: float = 0.0
+    evicted_decay_count: int = 0
 
     # 关联记忆（Hebbian关联）
     associations: Dict[str, float] = field(default_factory=dict)  # chunk_id -> weight
@@ -148,8 +163,13 @@ class MemoryChunk:
         if not self.access_log:
             self.access_log = [self.created_at]
 
-    def access(self):
-        """记录一次访问（60 秒窗口内去抖）"""
+    def access(self, decay: Optional[float] = None) -> bool:
+        """记录一次访问（60 秒窗口内去抖）
+
+        decay：本次使用事件的衰减速率（Pavlik 间隔效应，由核心层
+        根据访问瞬间的激活水平计算）。直接调用不传时记 None，
+        激活计算回退到类型基线 d。返回是否真正记录（未被去抖）。
+        """
         now = time.time()
         debounced = (
             self.access_count > 0
@@ -158,11 +178,20 @@ class MemoryChunk:
         self.last_accessed = now
         self.updated_at = now
         if debounced:
-            return
+            return False
         self.access_count += 1
         self.access_log.append(now)
+        self.access_decays.append(decay)
         if len(self.access_log) > self.ACCESS_LOG_SIZE:
             self.access_log = self.access_log[-self.ACCESS_LOG_SIZE:]
+        if len(self.access_decays) > self.ACCESS_LOG_SIZE:
+            # 被裁剪事件的衰减并入滑动累计，尾部积分不失去间隔惩罚
+            for dj in self.access_decays[:-self.ACCESS_LOG_SIZE]:
+                if dj is not None:
+                    self.evicted_decay_sum += dj
+                    self.evicted_decay_count += 1
+            self.access_decays = self.access_decays[-self.ACCESS_LOG_SIZE:]
+        return True
     
     def successful_recall(self):
         """记录一次成功唤醒"""
@@ -288,6 +317,9 @@ class MemoryChunk:
             "successful_recall_count": self.successful_recall_count,
             "recall_bias": self.recall_bias,
             "access_log": list(self.access_log),
+            "access_decays": list(self.access_decays),
+            "evicted_decay_sum": self.evicted_decay_sum,
+            "evicted_decay_count": self.evicted_decay_count,
             "associations": self.associations,
             "review_status": self.review_status,
             "review_note": self.review_note,
