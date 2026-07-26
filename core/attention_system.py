@@ -31,11 +31,19 @@ def _tokenize(text: str) -> Set[str]:
 
 
 def _overlap_score(left: Iterable[str], right: Iterable[str]) -> float:
+    """重叠系数（Szymkiewicz–Simpson）：交集 / 较小集合。
+
+    不用 Jaccard（交集/并集）：并集归一化会系统性惩罚长文本——
+    一段完整包含查询的段落级记忆，在 Jaccard 下得分趋近于 0
+    （查询 5 个词 / 并集几百个词），导致"正确答案因为太长而落选"。
+    重叠系数下，小集合被完整覆盖即得 1.0，与"这条记忆是否覆盖了
+    查询在问的东西"这一直觉一致。
+    """
     left_set = {x for x in left if x}
     right_set = {x for x in right if x}
     if not left_set or not right_set:
         return 0.0
-    return len(left_set & right_set) / max(1, len(left_set | right_set))
+    return len(left_set & right_set) / min(len(left_set), len(right_set))
 
 
 @dataclass
@@ -423,6 +431,13 @@ class AttentionScorer:
         frequency = min(1.0, math.log1p(procedure.use_count) / math.log(11))
         novelty = 1.0 / (1.0 + procedure.use_count)
 
+        # 与记忆评分同样的干扰惩罚：零相关的程序不能仅凭
+        # importance + confidence（合计可达 ~0.26）越过门槛，
+        # 否则每个工作区的程序位都会被无关但"自信"的程序占满
+        distraction_penalty = 0.0
+        if (query_tokens or goal_tokens) and query_relevance + goal_relevance < 0.08:
+            distraction_penalty = 0.18
+
         final = (
             goal_relevance * 0.32
             + query_relevance * 0.32
@@ -431,6 +446,7 @@ class AttentionScorer:
             + recency * 0.04
             + frequency * 0.03
             + novelty * 0.03
+            - distraction_penalty
         )
         final = max(0.0, min(1.0, final))
 
@@ -444,6 +460,7 @@ class AttentionScorer:
             recency=recency,
             frequency=frequency,
             novelty=novelty,
+            distraction_penalty=distraction_penalty,
         )
 
     def _chunk_tokens(self, chunk: MemoryChunk) -> Set[str]:

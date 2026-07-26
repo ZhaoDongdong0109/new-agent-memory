@@ -157,9 +157,14 @@ class PersonaLayer:
         elif signal_type in ("explicit_negative", "ignore"):
             self.profile.total_user_rejected += 1
         
-        # 检查是否需要评估
+        # 检查是否需要评估：首次达到评估门槛，之后每收集
+        # PERIODIC_EVALUATION_SIGNALS 个信号周期性重评。
+        # （旧逻辑用 last_evaluated==0 做条件，但 last_evaluated 每个
+        # 信号都会被刷新，导致评估只在第 10 个信号运行一次，
+        # enabled 状态永久冻结——"系统会学你"名不符实。）
         if pref.signals_collected >= self.INITIAL_EVALUATION_SIGNALS:
-            if pref.last_evaluated == 0 or pref.signals_collected == self.INITIAL_EVALUATION_SIGNALS:
+            if (pref.signals_collected == self.INITIAL_EVALUATION_SIGNALS
+                    or pref.signals_collected % self.PERIODIC_EVALUATION_SIGNALS == 0):
                 self._evaluate_behavior(behavior_key, pref)
         
         return pref.interest_score

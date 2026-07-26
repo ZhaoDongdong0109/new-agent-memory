@@ -697,10 +697,19 @@ class CognitiveState:
             self.open_questions.append(question)
             self.open_questions = self.open_questions[-20:]
 
+    # 不确定性标记：英文疑问词要求词边界（否则 "show" 命中 "how"、
+    # "whatever" 命中 "what"，普通陈述句被误标为不确定，污染
+    # open_questions 和驱动力）；"吗" 要求出现在句尾/标点前
+    # （疑问助词的位置特征），避免误伤普通词汇。
+    _UNCERTAIN_RE = re.compile(
+        r"[?？]"
+        r"|\b(?:how|why|what|should|could)\b"
+        r"|怎么|为什么|如何"
+        r"|吗(?=[。！!，,\s]|$)"
+    )
+
     def _looks_uncertain(self, text: str) -> bool:
-        lowered = text.lower()
-        markers = ["?", "？", "how", "why", "what", "should", "could", "怎么", "为什么", "吗", "如何"]
-        return any(marker in lowered for marker in markers)
+        return bool(self._UNCERTAIN_RE.search(text.lower()))
 
     def _trim(self):
         self.beliefs = sorted(self.beliefs, key=lambda item: item.updated_at, reverse=True)[:200]
