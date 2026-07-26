@@ -137,16 +137,28 @@ class MemoryChunk:
     # Petrov 混合近似精确保留的时间戳条数
     ACCESS_LOG_SIZE = 8
 
+    # 访问去抖窗口：窗口内的重复检索视为同一次"使用"。
+    # 狗粮期实测：一轮评测（19 个查询）就把访问计数刷到 40+，
+    # ACT-R 频率效应随即让"热门"记忆霸榜——人类一次回忆
+    # 不会让记忆强度暴涨，一分钟内的重复命中也不应该。
+    ACCESS_DEBOUNCE_SECONDS = 60.0
+
     def __post_init__(self):
         # 编码事件算第一次使用（旧数据没有 access_log 时同样成立）
         if not self.access_log:
             self.access_log = [self.created_at]
 
     def access(self):
-        """记录一次访问"""
+        """记录一次访问（60 秒窗口内去抖）"""
         now = time.time()
+        debounced = (
+            self.access_count > 0
+            and now - self.last_accessed < self.ACCESS_DEBOUNCE_SECONDS
+        )
         self.last_accessed = now
         self.updated_at = now
+        if debounced:
+            return
         self.access_count += 1
         self.access_log.append(now)
         if len(self.access_log) > self.ACCESS_LOG_SIZE:

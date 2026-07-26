@@ -171,6 +171,37 @@ class MemoryRetrieval:
         # 最近一次扩散激活的轨迹（联想回忆的可解释审计）
         self.last_activation_trace: List[Tuple[str, float]] = []
 
+    # 词汇覆盖率警戒阈值。
+    #
+    # 狗粮期实测教训：曾按"负例 0.38 vs 最低正例 0.54"设硬弃答阈值
+    # 0.45，随即被真实改述查询打脸——"中英文词汇割裂问题"（正例，
+    # 记忆原文说的是"零交集/双语同义词表"）覆盖率仅 0.29，比负例
+    # 还低。无嵌入的词面覆盖不可作硬弃答依据，只能做诚实标注：
+    # 低覆盖 -> QUESTIONABLE + 明确警告，把判断权交给调用方。
+    VOCAB_CAUTION_BELOW = 0.60   # 低于此值：低覆盖，降置信度并标注
+    VOCAB_WARNING_BELOW = 0.45   # 低于此值：强警告（结果很可能不相关）
+
+    def _vocab_coverage(self, query: str) -> Optional[float]:
+        """
+        查询词汇被记忆库索引覆盖的比例。
+
+        BM25 的中文 bigram 几乎总能部分匹配到点什么（虚词碎片），
+        导致库里完全没有的主题也会得到一个"自信"的回答——狗粮期
+        实测弃答正确率为 0。词汇覆盖率是确定性的界外检测信号：
+        查询的大部分 token 从未出现在任何记忆里，说明这个主题
+        根本不在库中，任何命中都是碎片噪声。
+        """
+        if not self.planner or not getattr(self.planner, "bm25", None):
+            return None
+        bm25 = self.planner.bm25
+        if not bm25.total_docs:
+            return None
+        tokens = bm25._tokenize(query)
+        if not tokens:
+            return None
+        known = sum(1 for t in set(tokens) if t in bm25.doc_freqs)
+        return known / len(set(tokens))
+
     def promote_woken(self, forgotten_results: List[tuple]) -> List[MemoryChunk]:
         """
         把唤醒结果中锚点足够强的记忆提升回核心层，
@@ -352,6 +383,7 @@ class MemoryRetrieval:
 
         # Step 1: 解析
         ctx = self.parse_query(query)
+        vocab_cov = self._vocab_coverage(query)
 
         # Step 2: 检索（混合或传统）
         retrieval_path = ""
@@ -410,6 +442,12 @@ class MemoryRetrieval:
         
         # 如果都没有命中
         if not all_chunks:
+            note = "没有找到相关记忆"
+            if vocab_cov is not None and vocab_cov < self.VOCAB_WARNING_BELOW:
+                note = (
+                    f"没有找到相关记忆（查询词汇覆盖率仅 {vocab_cov:.0%}，"
+                    f"该主题可能不在记忆库中）"
+                )
             return ReconstructionResult(
                 success=False,
                 chunks=[],
@@ -417,7 +455,7 @@ class MemoryRetrieval:
                 review_result=ReviewResult.REJECTED,
                 retrieval_path="none",
                 confidence=0.0,
-                review_note="没有找到相关记忆",
+                review_note=note,
             )
 
         # Step 3.2: 时态路由（双时态事实取代的读取侧）
@@ -504,9 +542,26 @@ class MemoryRetrieval:
         # Step 5: 审阅
         review_result, confidence = self._review(all_chunks, assembled, ctx)
 
+        # 低词汇覆盖：命中可能只是词面碎片重合，诚实标注而不是硬拒绝
+        # （改述查询的覆盖率可以比界外查询更低——狗粮期实测教训）
+        review_note = ""
+        if vocab_cov is not None and vocab_cov < self.VOCAB_WARNING_BELOW:
+            confidence *= 0.5
+            review_result = ReviewResult.QUESTIONABLE
+            review_note = (
+                f"警告：查询词汇与记忆库重合度很低（{vocab_cov:.0%}），"
+                f"以下结果可能不相关"
+            )
+        elif vocab_cov is not None and vocab_cov < self.VOCAB_CAUTION_BELOW:
+            confidence *= 0.7
+            review_note = (
+                f"查询词汇覆盖率较低（{vocab_cov:.0%}），结果谨慎参考"
+            )
+            if confidence < self.review_confidence_threshold:
+                review_result = ReviewResult.QUESTIONABLE
+
         # 全部结果都是被取代的旧事实：明确标注"已过时"，
         # 置信度打折，绝不冒充当前状态
-        review_note = ""
         if outdated_only:
             superseded_by = all_chunks[0].metadata.get("superseded_by", "")
             review_note = (
@@ -760,6 +815,9 @@ class MemoryRetrieval:
                 depth += 1
         return result
 
+    # 共激活去抖窗口：同一对记忆在窗口内的重复共现只加强一次
+    COACTIVATION_DEBOUNCE_SECONDS = 60.0
+
     def _coactivate(self, chunks: List[MemoryChunk], max_wired: int = 4, strength: float = 0.05):
         """
         Hebbian 共激活：同一次检索里一起出现的记忆互相加强关联。
@@ -767,11 +825,30 @@ class MemoryRetrieval:
         这是关联图的主要生长途径——没有它，扩散激活面对的是一张空图。
         只连线前几条核心层记忆：人类的共激活也是选择性的，
         全连接会让关联图退化成噪声。
+
+        60 秒去抖：狗粮期实测一轮评测就让边权疯长——短窗口内的
+        重复共现是同一次"共同经历"，不应重复加强。
         """
+        now = time.time()
+        if not hasattr(self, "_recent_coactivations"):
+            self._recent_coactivations: Dict[tuple, float] = {}
+
         core_chunks = [c for c in chunks if c.layer == MemoryLayer.CORE][:max_wired]
         for i, chunk_a in enumerate(core_chunks):
             for chunk_b in core_chunks[i + 1:]:
+                pair = tuple(sorted((chunk_a.id, chunk_b.id)))
+                last = self._recent_coactivations.get(pair, 0.0)
+                if now - last < self.COACTIVATION_DEBOUNCE_SECONDS:
+                    continue
+                self._recent_coactivations[pair] = now
                 self.core.strengthen_association(chunk_a.id, chunk_b.id, strength=strength)
+
+        # 防止去抖记录无限增长
+        if len(self._recent_coactivations) > 2000:
+            cutoff = now - self.COACTIVATION_DEBOUNCE_SECONDS
+            self._recent_coactivations = {
+                k: v for k, v in self._recent_coactivations.items() if v > cutoff
+            }
     
     def _assemble(
         self,

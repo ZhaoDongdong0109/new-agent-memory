@@ -75,6 +75,18 @@ def _containment(inner: Set[str], outer: Set[str]) -> float:
     return len(inner & outer) / len(inner)
 
 
+def _value_tokens(text: str) -> Set[str]:
+    """
+    提取"值类" token：数字串（含小数/版本号形态）。
+
+    狗粮期实测盲区：真实世界的事实更新大量是数字微差
+    （"版本是 0.1.0" -> "版本是 0.2.0"、价格、日期、门牌号），
+    整体 Jaccard 高达 0.8+ 会被误判为近重复 NOOP，旧值继续
+    冒充现状。数字不同 = 值变了，无论其余词面多相似。
+    """
+    return set(re.findall(r"\d+(?:[.\-]\d+)*", text))
+
+
 @dataclass
 class Decision:
     """一次写入决策（完整可审计）"""
@@ -154,13 +166,23 @@ class SupersessionEngine:
             return Decision(op="add", rule_id="R4_new_fact",
                             target_id=None, similarity=best_sim, surprise=surprise)
 
+        # 值变化检测优先于近重复判定：词面几乎相同但数字不同
+        # （版本/价格/日期微差）是最典型的事实更新，必须走取代
+        new_values = _value_tokens(chunk.content)
+        old_values = _value_tokens(best.content)
+        values_changed = bool(new_values or old_values) and new_values != old_values
+
         if best_sim >= NOOP_JACCARD:
+            if values_changed:
+                return Decision(op="supersede", rule_id="R3b_value_only_change",
+                                target_id=best.id, similarity=best_sim, surprise=surprise)
             return Decision(op="noop", rule_id="R1_near_duplicate",
                             target_id=best.id, similarity=best_sim, surprise=surprise)
 
         old_tokens = _chunk_tokens(best)
-        if _containment(old_tokens, new_tokens) >= UPDATE_CONTAINMENT:
+        if not values_changed and _containment(old_tokens, new_tokens) >= UPDATE_CONTAINMENT:
             # 新内容完整覆盖旧内容并有扩展 -> 同一事实的更完整版本
+            # （数字有变时不走 UPDATE：那是值更新，历史必须保留在取代链上）
             return Decision(op="update", rule_id="R2_extension",
                             target_id=best.id, similarity=best_sim, surprise=surprise)
 

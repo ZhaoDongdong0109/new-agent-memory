@@ -131,3 +131,13 @@ def test_maintain_reports_counts(server):
     server.memory.add_memory(content="一条普通记忆", topics=["测试"])
     text = _text(_call(server, "memory_maintain"))
     assert "core:" in text and "forgotten:" in text
+
+
+def test_add_with_fact_type_gets_supersession(server):
+    """MCP memory_add 指定 fact 类型后进入双时态取代管理"""
+    _call(server, "memory_add", {"content": "服务当前端口是 8420", "memory_type": "fact", "topics": ["配置"]})
+    _call(server, "memory_add", {"content": "服务当前端口是 9000", "memory_type": "fact", "topics": ["配置"]})
+
+    text = _text(_call(server, "memory_search", {"query": "现在的端口是多少"}))
+    assert "9000" in text
+    assert "8420" not in text, "被取代的旧端口冒充了现状"

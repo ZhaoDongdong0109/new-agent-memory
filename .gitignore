@@ -12,3 +12,4 @@ audit.log
 *.whl
 coverage.xml
 .coverage
+dogfood_data/store/
