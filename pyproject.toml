@@ -47,6 +47,16 @@ hub-sub-agent = "adapters.hub_sub_agent:main"
 [tool.hatch.build.targets.wheel]
 packages = ["core", "new_agent_memory", "hub", "adapters"]
 
+# 顶层模块：new_agent_memory 包直接 import 这些模块，
+# 缺少它们时非 editable 安装完全无法使用
+[tool.hatch.build.targets.wheel.force-include]
+"main.py" = "main.py"
+"memory_chunk.py" = "memory_chunk.py"
+"memory_layer_core.py" = "memory_layer_core.py"
+"forgotten_layer.py" = "forgotten_layer.py"
+"retrieval.py" = "retrieval.py"
+"mcp_server.py" = "mcp_server.py"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

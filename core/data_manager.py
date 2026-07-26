@@ -24,12 +24,24 @@ class DataManager:
         """
         self.memory = memory_system
 
-    def delete_all_user_data(self, user_id: str = "default") -> Dict:
+    def delete_all_user_data(
+        self,
+        user_id: str = "default",
+        force_reset_global: bool = False,
+    ) -> Dict:
         """
         删除用户所有数据
 
+        注意：persona / attention / cognitive_state 是全局共享状态，
+        并不按用户隔离。为避免删除单个用户时连带清空其他用户仍在
+        依赖的全局层，只有在删除后核心层与伪遗忘层不再残留任何记忆
+        （即被删除者是唯一用户），或调用方显式传入
+        force_reset_global=True 时，才会重置这三个全局层。
+
         Args:
             user_id: 用户 ID
+            force_reset_global: 即使仍存在其他用户的记忆，也强制重置
+                全局 persona / attention / cognitive 状态
 
         Returns:
             删除统计
@@ -64,20 +76,24 @@ class DataManager:
                 self.memory.forgotten.remove(chunk_id)
                 deleted["forgotten_memories"] += 1
 
+        # 全局层重置策略：仅当删除后不再残留任何记忆（被删除者是
+        # 唯一用户），或调用方显式要求时才重置，见方法 docstring。
+        reset_global = force_reset_global or not self._has_remaining_memories()
+
         # 重置 persona
-        if hasattr(self.memory, 'persona'):
+        if reset_global and hasattr(self.memory, 'persona'):
             from core.persona_layer import PersonaLayer
             self.memory.persona = PersonaLayer()
             deleted["persona"] = True
 
         # 重置 attention
-        if hasattr(self.memory, 'attention'):
+        if reset_global and hasattr(self.memory, 'attention'):
             from core.attention_system import AttentionOS
             self.memory.attention = AttentionOS()
             deleted["attention"] = True
 
         # 重置 cognitive state
-        if hasattr(self.memory, 'cognitive_state'):
+        if reset_global and hasattr(self.memory, 'cognitive_state'):
             from core.cognitive_state import CognitiveState
             self.memory.cognitive_state = CognitiveState()
             deleted["cognitive_state"] = True
@@ -86,7 +102,23 @@ class DataManager:
         if hasattr(self.memory, 'save'):
             self.memory.save()
 
+        # 写入审计日志（防御式：memory 系统可能没有 audit_logger 或为 None）
+        audit_logger = getattr(self.memory, 'audit_logger', None)
+        if audit_logger is not None and hasattr(audit_logger, 'log_data_deletion'):
+            try:
+                audit_logger.log_data_deletion(user_id=user_id, deleted=deleted)
+            except Exception as e:
+                print(f"[DataManager] 审计记录失败: {e}")
+
         return deleted
+
+    def _has_remaining_memories(self) -> bool:
+        """检查核心层与伪遗忘层是否仍残留任何记忆"""
+        for layer_name in ('core', 'forgotten'):
+            layer = getattr(self.memory, layer_name, None)
+            if layer and layer._store.get_all():
+                return True
+        return False
 
     def export_user_data(self, user_id: str = "default") -> Dict:
         """
@@ -192,14 +224,14 @@ class DataManager:
         """
         检查记忆是否属于用户
 
-        默认所有记忆都属于 "default" 用户。
-        可以通过 metadata.user_id 字段区分用户。
+        优先读取 MemoryChunk 的一等字段 user_id（main.add_memory /
+        add_raw_memory 写入的位置）；一等字段缺失或仍为缺省值
+        "default" 时，回退到 metadata["user_id"]（兼容旧数据）；
+        两者都没有明确标记时归属 "default" 用户。
         """
-        if user_id == "default":
-            # 默认用户拥有所有没有明确用户标记的记忆
-            chunk_user = chunk.metadata.get("user_id", "default")
-            return chunk_user == "default"
-        else:
-            # 非默认用户只拥有明确标记的记忆
-            chunk_user = chunk.metadata.get("user_id", "default")
-            return chunk_user == user_id
+        chunk_user = getattr(chunk, "user_id", None)
+        if not chunk_user or chunk_user == "default":
+            # 一等字段未明确标记用户，回退到 metadata（兼容旧数据）
+            metadata = getattr(chunk, "metadata", None) or {}
+            chunk_user = metadata.get("user_id") or chunk_user or "default"
+        return chunk_user == user_id

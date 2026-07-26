@@ -114,6 +114,13 @@ class QueryPlanner:
             fused = reciprocal_rank_fusion(rankings, self.rrf_k)
 
         # Step 5: 获取 chunk 并用权重重新排序
+        #
+        # 量纲对齐：RRF 原始分数的上界约为 sum(weights)/(k+1) ≈ 0.016，
+        # 而记忆权重在 0~1。直接线性混合时权重项会以 10-20 倍压倒相关性，
+        # "70% RRF + 30% 权重"名不符实。先把 RRF 分数按本批最大值归一化
+        # 到 0~1，再混合，比例才是真实的。
+        max_rrf = fused[0][1] if fused else 0.0
+
         results = []
         for chunk_id, rrf_score in fused[:limit * 2]:
             chunk = self._get_chunk(chunk_id)
@@ -125,31 +132,56 @@ class QueryPlanner:
                 else:
                     weight = 0.1  # 伪遗忘层的默认权重
 
-                # 混合分数：70% RRF + 30% 权重
-                final_score = 0.7 * rrf_score + 0.3 * weight
+                relevance = rrf_score / max_rrf if max_rrf > 0 else 0.0
+
+                # 混合分数：70% 相关性 + 30% 记忆权重
+                final_score = 0.7 * relevance + 0.3 * weight
                 results.append((chunk, final_score))
 
         # 排序并返回
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:limit]
 
+    # 真正可用作元数据锚点的键：只有查询里出现这些键时元数据腿才参与融合
+    _ANCHOR_KEYS = (
+        "time_absolute", "time_relative", "time_context",
+        "topics", "location", "persons",
+    )
+
     def _metadata_filter(self, query_tags: Dict[str, Any]) -> List[Tuple[str, float]]:
         """
         Metadata/Time Filter
 
-        使用现有的倒排索引进行候选选择。
+        使用现有的倒排索引进行候选选择，并按记忆权重排序。
+
+        两个关键约束：
+        1. 查询没有任何索引锚点（只有 emotion 之类）时不参与融合——
+           否则 _select_candidates 会退回全库扫描，把整个存储当成
+           "命中结果"灌进 RRF 的最大权重腿。
+        2. RRF 是基于名次的融合，无序候选集的名次毫无意义，
+           必须先按记忆权重排出真实顺序。
 
         Returns:
-            [(chunk_id, 1.0), ...] 候选列表（分数为 1.0，因为是精确匹配）
+            [(chunk_id, weight), ...] 按权重降序
         """
         if not self.core:
+            return []
+
+        if not any(key in query_tags for key in self._ANCHOR_KEYS):
             return []
 
         # 使用 core 的 _select_candidates 方法
         candidate_ids = self.core._select_candidates(query_tags)
 
-        # 转换为 (chunk_id, score) 格式
-        return [(cid, 1.0) for cid in candidate_ids]
+        # 按记忆权重排序，让 RRF 的名次有真实含义
+        scored = []
+        for cid in candidate_ids:
+            chunk = self.core.get(cid)
+            if chunk is None:
+                continue
+            scored.append((cid, self.core.calc_weight(chunk).final))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored
 
     def _get_chunk(self, chunk_id: str) -> Optional[MemoryChunk]:
         """获取 chunk（先查 core，再查 forgotten）"""

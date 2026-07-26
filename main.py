@@ -69,6 +69,9 @@ class HumanLikeMemorySystem:
         # 检索参数
         retrieval_confidence_threshold: float = 0.5,
 
+        # 混合检索（BM25 + Dense + RRF）。关闭则退回纯标签检索。
+        enable_hybrid_retrieval: bool = True,
+
         # 安全与治理参数
         enable_pii_detection: bool = True,
         enable_audit_log: bool = True,
@@ -96,9 +99,25 @@ class HumanLikeMemorySystem:
             cleanup_age_days=forgotten_cleanup_age_days,
         )
 
+        # 混合检索栈：把 BM25/Dense/RRF 真正接入生产检索路径。
+        # 只索引核心层——伪遗忘层的记忆按设计必须通过线索唤醒进入，
+        # 不应该出现在主动检索的候选里。
+        self.query_planner = None
+        if enable_hybrid_retrieval:
+            from core.bm25_retriever import BM25Retriever
+            from core.dense_retriever import DenseRetriever
+            from core.query_planner import QueryPlanner
+            self.query_planner = QueryPlanner(
+                core_layer=self.core,
+                forgotten_layer=None,
+                bm25=BM25Retriever(),
+                dense=DenseRetriever(),
+            )
+
         self.retrieval = MemoryRetrieval(
             core_layer=self.core,
             forgotten_layer=self.forgotten,
+            planner=self.query_planner,
             review_confidence_threshold=retrieval_confidence_threshold,
         )
 
@@ -258,6 +277,8 @@ class HumanLikeMemorySystem:
             self.forgotten.archive(chunk)
         else:
             self.core.add(chunk)
+            if self.query_planner:
+                self.query_planner.add_chunk(chunk)
 
         # 记录创建审计
         if self.audit_logger:
@@ -407,6 +428,8 @@ class HumanLikeMemorySystem:
 
         # 步骤4：存储
         self.core.add(chunk)
+        if self.query_planner:
+            self.query_planner.add_chunk(chunk)
 
         # 记录创建审计
         if self.audit_logger:
@@ -581,9 +604,11 @@ class HumanLikeMemorySystem:
         
         # 尝试伪遗忘层唤醒
         forgotten_results = self.forgotten.try_wake(ctx.to_tags())
-        
+
         if forgotten_results:
             chunks = [c for c, _ in forgotten_results]
+            # 锚点足够强的唤醒记忆提升回核心层（遗忘-唤醒闭环）
+            self.retrieval.promote_woken(forgotten_results)
             assembled = self._assemble_chunks(chunks, ctx)
             review_result, confidence = self._review_chunks(chunks, assembled, ctx)
             
@@ -886,6 +911,9 @@ class HumanLikeMemorySystem:
             degraded = self.core.degrade_chunks(to_degrade)
             for chunk in degraded:
                 self.forgotten.archive(chunk)
+                # 降级即离开主动检索：同步从混合检索索引移除
+                if self.query_planner:
+                    self.query_planner.remove_chunk(chunk.id)
         
         # 伪遗忘层清理
         self.forgotten.cleanup()
@@ -929,6 +957,10 @@ class HumanLikeMemorySystem:
         """加载数据"""
         core_loaded = self.core.load()
         forgotten_loaded = self.forgotten.load()
+
+        # 重建混合检索索引（BM25/Dense 索引只存在于内存）
+        if self.query_planner and core_loaded:
+            self.query_planner.index_chunks(self.core.chunks)
 
         # 加载人格适应层
         persona_path = f"{self.data_dir}/persona.json"

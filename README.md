@@ -423,20 +423,46 @@ new-agent-memory/
 
 ## Memory Model
 
-权重由多种信号共同决定：
+权重由多种信号共同决定。关键设计：情绪、重要性、连接价值这些"静态"因子被时间衰减门控，否则它们会构成一个永不衰减的权重下限，导致记忆永远无法被遗忘：
 
 ```text
 effective_weight =
   time_decay
   + access_frequency
   + recency
-  + emotion_boost
+  + time_decay * (emotion_boost + importance + connection_value)
   + association_density
-  + importance
-  + connection_value
+  + recall_bias        # 回忆反馈偏置：被确认的记忆上浮，被纠错的下沉
 ```
 
-当核心记忆权重低于阈值时，它会降级到伪遗忘层。伪遗忘层不会主动参与普通检索，但当查询里出现足够强的锚点，例如地点、人物、主题，系统可以重新唤醒这段记忆。
+完整的遗忘-唤醒生命周期：
+
+```text
+add -> 使用中（访问/反馈强化）
+  -> 长期不用权重衰减 -> maintain() 降级到伪遗忘层
+  -> 伪遗忘层不参与主动检索
+  -> 查询携带足够强的锚点（人物/地点/主题/时间）-> try_wake 唤醒
+  -> 锚点足够强 -> promote 提升回核心层（带再巩固奖励）
+  -> 继续被使用则留下，不用则再次自然衰减
+```
+
+每一步都可解释：`WeightFactors` 给出权重的逐因子拆解，唤醒有得分与锚点计数，提升有统计口径（`retrieval.total_promoted`）。
+
+## Retrieval Model
+
+生产检索路径是三腿混合检索 + RRF 融合：
+
+```text
+query -> QueryContext（时间/地点/人物/主题锚点）
+  |-- Metadata leg: 倒排索引候选，按记忆权重排序
+  |-- BM25 leg:     词法相关性（中文字符级 + 关键词）
+  |-- Dense leg:    哈希 TF-IDF 余弦相似度
+  -> RRF 融合（按批内最大值归一化）
+  -> 70% 相关性 + 30% 记忆权重 混合排序
+  -> 未命中 -> 伪遗忘层锚点唤醒
+```
+
+查询侧与写入侧共享一张双语主题词汇表（`core/topic_vocab.py`），中文查询可以命中英文标签的记忆，反之亦然。
 
 ## Attention Model
 
@@ -507,14 +533,16 @@ python -m compileall .
 - [x] 模型无关 LLMPlanner
 - [x] CognitiveState 自我/世界模型与反思闭环
 - [x] Hermes / OpenAI-compatible Agent adapter
-- [ ] CLI：`memory add/search/stats`
-- [ ] 自动记忆提取器 `MemoryExtractor`
-- [ ] 经验复盘与矛盾处理 `ConsolidationEngine`
-- [ ] SQLite 持久化后端
+- [x] CLI：`memory add/search/stats`
+- [x] 自动记忆提取器 `MemoryExtractor`
+- [x] SQLite 持久化后端
+- [x] 向量检索 / BM25 / RRF 混合检索（已接入生产检索路径）
+- [x] 遗忘-唤醒生命周期闭环（降级 → 线索唤醒 → 提升回核心层）
+- [x] MCP Server 集成
+- [ ] 经验复盘与矛盾处理 `ConsolidationEngine`（已实现，待接入 Agent 主循环）
 - [ ] 更强的自然语言线索解析
 - [ ] LLM 驱动的碎片组装与审阅
-- [ ] 向量检索 / BM25 / 图关联的混合检索
-- [ ] MCP 或 LangGraph 集成示例
+- [ ] 真实向量嵌入（当前 Dense 腿为哈希 TF-IDF）
 
 ## Positioning
 

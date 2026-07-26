@@ -10,10 +10,8 @@
 重构：使用可插拔 MemoryStore 后端
 """
 
-from typing import Dict, List, Optional, Set, Any
-import math
+from typing import Dict, List, Optional, Tuple, Any
 import time
-import json
 from dataclasses import dataclass
 
 from memory_chunk import MemoryChunk, MemoryLayer
@@ -111,23 +109,32 @@ class ForgottenLayer:
 
     # ============ 唤醒机制 ============
 
-    def calc_wake_score(self, chunk: MemoryChunk, query_tags: Dict[str, Any]) -> float:
+    def calc_wake_score(self, chunk: MemoryChunk, query_tags: Dict[str, Any]) -> Tuple[float, int]:
         """
         计算唤醒得分
 
-        锚点匹配越强，得分越高
+        锚点匹配越强，得分越高。返回 (得分, 匹配锚点数)。
         """
         score = 0.0
         matched_tags = 0
 
-        # 时间标签匹配（最重要）
+        # 绝对时间锚点（最重要）
         if "time_absolute" in query_tags:
             if chunk.time_absolute == query_tags["time_absolute"]:
                 score += 0.3
                 matched_tags += 1
-            elif chunk.time_relative and chunk.time_relative == query_tags.get("time_relative"):
-                score += 0.2
-                matched_tags += 1
+
+        # 相对时间 / 时间上下文锚点：独立生效，互相宽松匹配
+        # （"昨天"、"中午"这类线索不应该依赖查询同时给出绝对时间）
+        relative_anchor = query_tags.get("time_relative")
+        context_anchor = query_tags.get("time_context")
+        chunk_times = {t for t in (chunk.time_relative, chunk.time_context) if t}
+        if relative_anchor and relative_anchor in chunk_times:
+            score += 0.2
+            matched_tags += 1
+        if context_anchor and context_anchor != relative_anchor and context_anchor in chunk_times:
+            score += 0.15
+            matched_tags += 1
 
         # 地点匹配
         if "location" in query_tags:
@@ -143,10 +150,15 @@ class ForgottenLayer:
                 matched_tags += 1
 
         # 主题匹配
+        # 按"概念组"计算覆盖率：查询主题经过同义扩展后标签数会膨胀，
+        # 直接用标签数做分母会稀释匹配强度
         if "topics" in query_tags:
             matched_topics = query_tags["topics"] & chunk.topics
             if matched_topics:
-                score += 0.15 * (len(matched_topics) / max(len(query_tags["topics"]), 1))
+                from core.topic_vocab import count_topic_groups
+                query_groups = max(count_topic_groups(query_tags["topics"]), 1)
+                matched_groups = min(count_topic_groups(matched_topics), query_groups)
+                score += 0.15 * (matched_groups / query_groups)
                 matched_tags += 1
 
         # 情绪方向匹配
@@ -188,12 +200,42 @@ class ForgottenLayer:
         # 按得分降序
         candidates.sort(key=lambda x: x[1], reverse=True)
 
-        result = [(c, tw) for c, s, tw in candidates[:limit]]
+        woken = candidates[:limit]
+        result = [(c, tw) for c, s, tw in woken]
 
         if result:
             self.total_wake_success += 1
+            # 唤醒即留痕：记录成功唤醒并写回存储，
+            # 让"这段记忆被线索唤醒过"成为持久事实（影响清理与后续提升决策）
+            for chunk, _score, _tw in woken:
+                chunk.successful_recall()
+                chunk.updated_at = time.time()
+                self._store.put(chunk)
 
         return result
+
+    def promote(self, chunk_ids: List[str]) -> List[MemoryChunk]:
+        """
+        把被唤醒的记忆从伪遗忘层移出，交还给核心层。
+
+        返回被移出的记忆（layer 已置回 CORE，并带有一次"再巩固奖励"：
+        recall_bias 小幅上浮，给重新唤醒的记忆一个存活窗口——
+        如果之后继续被使用它会留下，不用则会再次自然衰减降级）。
+
+        调用方（检索层）负责将返回的 chunk 通过 core.add() 放回核心层。
+        """
+        promoted = []
+        for chunk_id in chunk_ids:
+            chunk = self._store.get(chunk_id)
+            if not chunk:
+                continue
+            self._store.delete(chunk_id)
+            chunk.layer = MemoryLayer.CORE
+            chunk.updated_at = time.time()
+            # 再巩固奖励：唤醒后的记忆获得短期权重支撑
+            chunk.recall_bias = min(0.25, chunk.recall_bias + 0.05)
+            promoted.append(chunk)
+        return promoted
 
     def wake_and_promote(
         self,
@@ -201,24 +243,18 @@ class ForgottenLayer:
         promotion_weight_threshold: float = 0.4,
     ) -> List[MemoryChunk]:
         """
-        唤醒记忆，并提升回核心层
+        唤醒记忆，并把得分足够高的移出伪遗忘层。
 
-        如果唤醒后得分足够高（可能是有价值的记忆），放回核心层
-
-        返回：被提升到核心层的记忆列表
+        返回：被移出（待放回核心层）的记忆列表。
+        注意：与 promote() 相同，调用方负责 core.add()。
         """
         candidates = self.try_wake(query_tags, limit=10)
 
-        promoted = []
-        for chunk, temp_weight in candidates:
-            chunk.successful_recall()
-
-            # 如果唤醒得分很高（记忆很有价值），提升回核心层
-            # 但目前我们无法在伪遗忘层准确计算权重，所以用临时权重代替
-            if temp_weight >= promotion_weight_threshold:
-                promoted.append(chunk)
-
-        return promoted
+        to_promote = [
+            chunk.id for chunk, temp_weight in candidates
+            if temp_weight >= promotion_weight_threshold
+        ]
+        return self.promote(to_promote)
 
     # ============ 审阅 ============
 

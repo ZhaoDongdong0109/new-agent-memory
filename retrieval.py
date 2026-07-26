@@ -17,8 +17,9 @@ import time
 import re
 
 from memory_chunk import MemoryChunk, MemoryLayer
-from memory_layer_core import MemoryLayerCore, WeightFactors
+from memory_layer_core import MemoryLayerCore
 from forgotten_layer import ForgottenLayer
+from core.topic_vocab import expand_topics, extract_query_topics
 
 
 class ReviewResult(Enum):
@@ -135,6 +136,9 @@ class MemoryRetrieval:
 
         # 审阅参数
         review_confidence_threshold: float = 0.5,  # 低于此值标记为 questionable
+
+        # 唤醒提升参数：唤醒临时权重达到该值的记忆会被提升回核心层
+        promote_threshold: float = 0.55,
     ):
         self.core = core_layer
         self.forgotten = forgotten_layer
@@ -144,12 +148,39 @@ class MemoryRetrieval:
         self.forgotten_min_match = forgotten_min_match
         self.assembly_method = assembly_method
         self.review_confidence_threshold = review_confidence_threshold
+        self.promote_threshold = promote_threshold
 
         # 统计
         self.total_retrievals = 0
         self.core_hit = 0
         self.forgotten_hit = 0
         self.both_hit = 0
+        self.total_promoted = 0
+
+    def promote_woken(self, forgotten_results: List[tuple]) -> List[MemoryChunk]:
+        """
+        把唤醒结果中锚点足够强的记忆提升回核心层。
+
+        这是"遗忘-唤醒"生命周期的关键闭环：
+        降级(maintain) -> 归档(forgotten) -> 线索唤醒(try_wake)
+          -> 提升(promote) -> 重新进入核心层与检索索引
+
+        弱唤醒（低于 promote_threshold）保持归档状态，但 try_wake
+        已经为它们记录了唤醒痕迹。
+        """
+        ids = [
+            chunk.id for chunk, temp_weight in forgotten_results
+            if temp_weight >= self.promote_threshold
+        ]
+        promoted = self.forgotten.promote(ids)
+        for chunk in promoted:
+            self.core.add(chunk)
+            # 提升即访问：给再巩固的记忆一个新鲜的近因信号
+            self.core.access(chunk.id)
+            if self.planner:
+                self.planner.add_chunk(chunk)
+        self.total_promoted += len(promoted)
+        return promoted
     
     # ============ 查询解析 ============
     
@@ -160,56 +191,46 @@ class MemoryRetrieval:
         目前是简化版规则解析，未来可以换成LLM
         """
         ctx = QueryContext(raw_query=query)
-        current_year = time.localtime().tm_year
-        
+
         # 相对时间解析
-        time_relative_patterns = {
-            r"(\d+)年前": lambda m: f"{current_year - int(m.group(1))}年",
-            r"(\d+)年前.*中午": lambda m: f"{current_year - int(m.group(1))}年",
-            r"昨天": lambda _: "昨天",
-            r"上周": lambda _: "上周",
-            r"上个月": lambda _: "上个月",
-            r"去年": lambda _: "去年",
-        }
-        
-        for pattern, handler in time_relative_patterns.items():
+        #
+        # 注意：保留原始表述（"10年前"），不换算成"2016年"这类年份字符串——
+        # 写入侧存储的就是用户给出的原始相对时间，换算后的表述任何写入路径
+        # 都不会存储，等值匹配将永远失败。
+        time_relative_patterns = [
+            r"\d+年前",
+            r"昨天",
+            r"上周",
+            r"上个月",
+            r"去年",
+        ]
+
+        for pattern in time_relative_patterns:
             match = re.search(pattern, query)
             if match:
-                ctx.time_relative = handler(match)
-                if "中午" in query or "午饭" in query or "午餐" in query:
-                    ctx.time_context = "中午"
+                ctx.time_relative = match.group(0)
                 break
-        
+
         # 时间上下文解析
         if "中午" in query or "午饭" in query or "午餐" in query:
             ctx.time_context = ctx.time_context or "中午"
-        
+
         # 地点解析（简化）
         locations = ["北京", "上海", "家里", "公司", "餐厅", "酒店", "机场"]
         for loc in locations:
             if loc in query:
                 ctx.location = loc
                 break
-        
+
         # 人物解析（简化）
         person_pattern = r"和(.+?)(一起|吃的|去的|见的)"
         match = re.search(person_pattern, query)
         if match:
             ctx.persons.add(match.group(1))
-        
-        # 主题解析
-        topic_keywords = {
-            "吃": {"food", "dining", "meal"},
-            "饭": {"food", "dining", "meal"},
-            "旅行": {"travel", "trip"},
-            "出差": {"business", "work"},
-            "会议": {"meeting", "work"},
-            "项目": {"project", "work"},
-        }
-        
-        for keyword, topics in topic_keywords.items():
-            if keyword in query:
-                ctx.topics.update(topics)
+
+        # 主题解析：使用统一双语词汇表（core/topic_vocab.py），
+        # 扩展出的标签能同时命中中文与英文写入侧的主题
+        ctx.topics.update(extract_query_topics(query))
         
         # 情绪解析（简化）
         positive_words = ["开心", "高兴", "快乐", "愉快", "棒", "好"]
@@ -244,22 +265,39 @@ class MemoryRetrieval:
         if timestamp:
             # 假设是时间戳
             ctx.time_absolute = time.strftime("%Y-%m-%d", time.localtime(timestamp))
-            ctx.time_context = time.strftime("%H:%M", time.localtime(timestamp))
-        
+            # 时钟时间没有任何写入路径会存储（记忆的 time_context 是"中午"这类
+            # 语义时段），必须换算成时段词才可能匹配
+            ctx.time_context = self._hour_to_daypart(time.localtime(timestamp).tm_hour)
+
         # 地点
         location = photo_info.get("location")
         if location:
             ctx.location = location
-        
+
         # 人物
         faces = photo_info.get("faces", [])
         ctx.persons.update(faces)
-        
-        # 标签
+
+        # 标签（扩展同义主题，兼容中英文写入侧）
         labels = photo_info.get("labels", [])
-        ctx.topics.update(labels)
-        
+        ctx.topics.update(expand_topics(labels))
+
         return ctx
+
+    @staticmethod
+    def _hour_to_daypart(hour: int) -> str:
+        """把小时映射为语义时段（与记忆的 time_context 词汇一致）"""
+        if 5 <= hour < 8:
+            return "早上"
+        if 8 <= hour < 11:
+            return "上午"
+        if 11 <= hour < 14:
+            return "中午"
+        if 14 <= hour < 18:
+            return "下午"
+        if 18 <= hour < 23:
+            return "晚上"
+        return "深夜"
     
     # ============ 检索 ============
     
@@ -318,6 +356,8 @@ class MemoryRetrieval:
                 if forgotten_results:
                     self.forgotten_hit += 1
                     all_chunks = [chunk for chunk, _ in forgotten_results]
+                    # 锚点足够强的唤醒记忆提升回核心层（遗忘-唤醒闭环）
+                    self.promote_woken(forgotten_results)
                 else:
                     retrieval_path = "none"
             else:
@@ -354,6 +394,8 @@ class MemoryRetrieval:
                 if forgotten_results:
                     self.forgotten_hit += 1
                     all_chunks = [chunk for chunk, _ in forgotten_results]
+                    # 锚点足够强的唤醒记忆提升回核心层（遗忘-唤醒闭环）
+                    self.promote_woken(forgotten_results)
                 else:
                     retrieval_path = "none"
             else:
@@ -586,6 +628,7 @@ class MemoryRetrieval:
             "total_retrievals": self.total_retrievals,
             "core_hit_rate": self.core_hit / max(1, self.total_retrievals),
             "forgotten_hit_rate": self.forgotten_hit / max(1, self.total_retrievals),
+            "total_promoted": self.total_promoted,
             "core_chunks": len(self.core),
             "forgotten_chunks": len(self.forgotten),
         }

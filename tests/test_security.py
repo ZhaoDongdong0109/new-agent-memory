@@ -4,11 +4,9 @@
 测试 PII 检测、脱敏、数据删除、审计日志。
 """
 
-import json
 import os
 import sys
 import tempfile
-import time
 
 sys.path.insert(0, '.')
 
@@ -46,8 +44,8 @@ def test_pii_handler():
     assert "t***@example.com" in anonymized
 
     # 测试 has_pii
-    assert handler.has_pii(text1) == True
-    assert handler.has_pii("今天天气很好") == False
+    assert handler.has_pii(text1)
+    assert not handler.has_pii("今天天气很好")
 
     # 测试 get_pii_types
     pii_types = handler.get_pii_types(text1)
@@ -64,6 +62,109 @@ def test_pii_handler():
     assert any(pii["type"] == "id_card" for pii in pii_list)
 
     print("✅ PII 处理器测试通过\n")
+
+
+def test_pii_overlapping_matches_preserve_adjacent_text():
+    """回归测试：重叠匹配不应损坏相邻文本
+
+    此前 redact/anonymize 基于原文偏移逐个替换重叠区间，
+    后续替换使用失效偏移，导致相邻文本被删除。
+    """
+    print("=== 测试重叠 PII 匹配 ===")
+
+    handler = PIIHandler()
+    text = "身份证110101199001011234的用户"
+
+    redacted = handler.redact(text)
+    print(f"脱敏结果: {redacted}")
+    assert redacted == "身份证[REDACTED]的用户"
+    assert redacted.endswith("的用户")  # 相邻文本必须保留
+    assert "110101199001011234" not in redacted
+
+    anonymized = handler.anonymize_text(text)
+    print(f"匿名化结果: {anonymized}")
+    assert anonymized == "身份证1101**********1234的用户"
+    assert anonymized.endswith("的用户")
+
+    # 相邻（首尾相接）的 PII 也不应损坏文本
+    text2 = "13812345678test@example.com"
+    redacted2 = handler.redact(text2)
+    print(f"相邻 PII 脱敏: {redacted2}")
+    assert "13812345678" not in redacted2
+    assert "test@example.com" not in redacted2
+
+    # 手机号嵌入邮箱本地部分（部分重叠）
+    text3 = "联系a13812345678@example.com结束"
+    redacted3 = handler.redact(text3)
+    print(f"部分重叠脱敏: {redacted3}")
+    assert redacted3 == "联系[REDACTED]结束"
+    anonymized3 = handler.anonymize_text(text3)
+    print(f"部分重叠匿名化: {anonymized3}")
+    assert anonymized3 == "联系a***@example.com结束"
+
+    print("✅ 重叠 PII 匹配测试通过\n")
+
+
+def test_pii_numeric_boundaries_no_false_positives():
+    """回归测试：非 PII 数字串不应被误报
+
+    此前无边界保护的数字模式会命中订单号、版本号、
+    以及更长数字串内嵌的"手机号"片段。
+    """
+    print("=== 测试数字边界误报 ===")
+
+    handler = PIIHandler()
+
+    # 订单号（16 位但 Luhn 校验失败）不应被识别为银行卡
+    text1 = "订单号 2026072612345678"
+    print(f"订单号: {handler.redact(text1)}")
+    assert handler.redact(text1) == text1
+    assert not handler.has_pii(text1)
+
+    # 版本号（超过 4 段的点分数字串）不应被识别为 IP
+    text2 = "版本 10.2.3.4.5"
+    print(f"版本号: {handler.redact(text2)}")
+    assert handler.redact(text2) == text2
+    assert not handler.has_pii(text2)
+
+    # 八位组超出 0-255 的点分数字串不是 IP
+    text3 = "代码999.999.999.999测试"
+    assert handler.redact(text3) == text3
+
+    # 嵌在更长数字串中的"手机号"片段不应被识别
+    text4 = "工单99138123456780号"
+    print(f"工单号: {handler.redact(text4)}")
+    assert handler.redact(text4) == text4
+    assert not handler.has_pii(text4)
+
+    print("✅ 数字边界误报测试通过\n")
+
+
+def test_pii_real_values_still_detected():
+    """回归测试：加了边界与校验后，真实 PII 仍能被识别"""
+    print("=== 测试真实 PII 仍被识别 ===")
+
+    handler = PIIHandler()
+
+    # Luhn 合法的银行卡号
+    text1 = "卡号4111111111111111请脱敏"
+    types1 = handler.get_pii_types(text1)
+    print(f"银行卡: {types1}")
+    assert "bank_card" in types1
+    assert "4111111111111111" not in handler.redact(text1)
+
+    # 真实手机号
+    assert "phone" in handler.get_pii_types("联系电话13812345678")
+
+    # 合法 IP 地址
+    text2 = "服务器地址192.168.1.100"
+    assert "ip_address" in handler.get_pii_types(text2)
+    assert "192.168.1.100" not in handler.redact(text2)
+
+    # 身份证号
+    assert "id_card" in handler.get_pii_types("身份证110101199001011234")
+
+    print("✅ 真实 PII 识别测试通过\n")
 
 
 def test_data_manager():
@@ -297,6 +398,9 @@ def test_benchmark_metrics():
 
 if __name__ == "__main__":
     test_pii_handler()
+    test_pii_overlapping_matches_preserve_adjacent_text()
+    test_pii_numeric_boundaries_no_false_positives()
+    test_pii_real_values_still_detected()
     test_data_manager()
     test_audit_logger()
     test_benchmark_metrics()

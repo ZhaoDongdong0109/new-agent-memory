@@ -14,7 +14,6 @@
 from typing import Dict, List, Optional, Set, Tuple, Any
 import math
 import time
-import json
 from dataclasses import dataclass
 
 from memory_chunk import MemoryChunk, MemoryLayer
@@ -30,6 +29,7 @@ class WeightFactors:
     association_density: float = 0.0
     importance_base: float = 0.0
     connection_boost: float = 0.0
+    recall_bias: float = 0.0
     final: float = 0.0
 
 
@@ -118,6 +118,11 @@ class MemoryLayerCore:
         # 权重计算会频繁触发，短期缓存能避免重复扫描时反复计算
         self.weight_cache: Dict[str, CachedWeight] = {}
 
+        # 索引键快照：id -> 实际写入索引的键列表。
+        # 移除时按快照精确回滚，而不是按 chunk 当前状态推断——
+        # 否则调用方原地修改 topics 后再 add()，旧键会永远残留在索引里。
+        self._index_keys: Dict[str, List[Tuple[str, str]]] = {}
+
         # 统计
         self.total_recall_success = 0
         self.total_recall_fail = 0
@@ -176,15 +181,25 @@ class MemoryLayerCore:
         connection_boost = chunk.connection_value
 
         # 综合权重
+        #
+        # 关键设计：情绪、重要性、连接价值这三个"静态"因子必须被 time_decay 门控。
+        # 否则它们构成一个不随时间衰减的权重下限（约 0.195），永远高于
+        # degrade_threshold（默认 0.15），导致任何默认记忆都无法降级到伪遗忘层，
+        # "遗忘-唤醒"生命周期完全失效。门控后，长期不用的记忆权重会真正
+        # 逼近 ~0.04，降级变得可达；而高重要性/强情绪记忆依然衰减得更慢。
         final = (
             self.coeffs['time_decay'] * time_decay +
             self.coeffs['frequency'] * frequency +
             self.coeffs['recency'] * recency +
-            self.coeffs['emotion'] * (0.5 + 0.5 * emotion_boost) +
-            self.coeffs['association'] * association_density +
-            self.coeffs['importance'] * importance_base +
-            self.coeffs['connection'] * connection_boost
+            time_decay * (
+                self.coeffs['emotion'] * (0.5 + 0.5 * emotion_boost) +
+                self.coeffs['importance'] * importance_base +
+                self.coeffs['connection'] * connection_boost
+            ) +
+            self.coeffs['association'] * association_density
         )
+        # 回忆反馈偏置：被确认正确的记忆权重上浮，被纠错的下沉
+        final += chunk.recall_bias
         final = max(0.0, min(1.0, final))
 
         factors = WeightFactors(
@@ -195,6 +210,7 @@ class MemoryLayerCore:
             association_density=association_density,
             importance_base=importance_base,
             connection_boost=connection_boost,
+            recall_bias=chunk.recall_bias,
             final=final,
         )
         self.weight_cache[chunk.id] = CachedWeight(factors=factors, calculated_at=time.time())
@@ -204,56 +220,55 @@ class MemoryLayerCore:
         """清除单条记忆的权重缓存"""
         self.weight_cache.pop(chunk_id, None)
 
+    # 索引名 -> 索引 dict 的映射（快照回滚时使用）
+    def _index_map(self) -> Dict[str, Dict[str, Set[str]]]:
+        return {
+            "time": self.time_index,
+            "time_relative": self.time_relative_index,
+            "time_context": self.time_context_index,
+            "topic": self.topic_index,
+            "location": self.location_index,
+            "person": self.person_index,
+        }
+
     def _add_to_index(self, chunk: MemoryChunk):
-        """把记忆加入倒排索引"""
+        """把记忆加入倒排索引，并记录键快照"""
         if chunk.id not in self.all_ids:
             self.all_ids.append(chunk.id)
 
+        keys: List[Tuple[str, str]] = []
+
         if chunk.time_absolute:
-            year_month = chunk.time_absolute[:7]
-            self.time_index.setdefault(year_month, set()).add(chunk.id)
-
+            keys.append(("time", chunk.time_absolute[:7]))
         if chunk.time_relative:
-            self.time_relative_index.setdefault(chunk.time_relative, set()).add(chunk.id)
-
+            keys.append(("time_relative", chunk.time_relative))
         if chunk.time_context:
-            self.time_context_index.setdefault(chunk.time_context, set()).add(chunk.id)
-
+            keys.append(("time_context", chunk.time_context))
         for topic in chunk.topics:
-            self.topic_index.setdefault(topic, set()).add(chunk.id)
-
+            keys.append(("topic", topic))
         if chunk.location:
-            self.location_index.setdefault(chunk.location, set()).add(chunk.id)
-
+            keys.append(("location", chunk.location))
         for person in chunk.persons:
-            self.person_index.setdefault(person, set()).add(chunk.id)
+            keys.append(("person", person))
+
+        index_map = self._index_map()
+        for index_name, key in keys:
+            index_map[index_name].setdefault(key, set()).add(chunk.id)
+
+        self._index_keys[chunk.id] = keys
 
     def _remove_from_index(self, chunk: MemoryChunk):
-        """从倒排索引移除记忆"""
+        """从倒排索引移除记忆（按加入时的键快照精确回滚）"""
         if chunk.id in self.all_ids:
             self.all_ids.remove(chunk.id)
 
-        if chunk.time_absolute:
-            year_month = chunk.time_absolute[:7]
-            if year_month in self.time_index:
-                self.time_index[year_month].discard(chunk.id)
-
-        if chunk.time_relative and chunk.time_relative in self.time_relative_index:
-            self.time_relative_index[chunk.time_relative].discard(chunk.id)
-
-        if chunk.time_context and chunk.time_context in self.time_context_index:
-            self.time_context_index[chunk.time_context].discard(chunk.id)
-
-        for topic in chunk.topics:
-            if topic in self.topic_index:
-                self.topic_index[topic].discard(chunk.id)
-
-        if chunk.location and chunk.location in self.location_index:
-            self.location_index[chunk.location].discard(chunk.id)
-
-        for person in chunk.persons:
-            if person in self.person_index:
-                self.person_index[person].discard(chunk.id)
+        index_map = self._index_map()
+        for index_name, key in self._index_keys.pop(chunk.id, []):
+            bucket = index_map[index_name].get(key)
+            if bucket is not None:
+                bucket.discard(chunk.id)
+                if not bucket:
+                    del index_map[index_name][key]
 
         self._invalidate_weight(chunk.id)
 
@@ -267,6 +282,7 @@ class MemoryLayerCore:
         self.location_index.clear()
         self.person_index.clear()
         self.weight_cache.clear()
+        self._index_keys.clear()
         for chunk in self._store.get_all().values():
             self._add_to_index(chunk)
 
@@ -336,6 +352,8 @@ class MemoryLayerCore:
         if not chunk:
             return None
         chunk.access()
+        # 必须写回：SQLite 后端的 get() 返回副本，不写回则访问统计静默丢失
+        self._store.put(chunk)
         self._invalidate_weight(chunk.id)
         return chunk, self.calc_weight(chunk)
 
@@ -363,9 +381,12 @@ class MemoryLayerCore:
         返回：[(碎片, 权重), ...]，按权重降序
         """
         import heapq
+        import itertools
 
-        # min-heap，存储 (-weight, chunk, wf) 以便快速获取 top-k
+        # min-heap，存储 (-weight, seq, chunk, wf) 以便快速获取 top-k。
+        # seq 是单调递增的平局打破器：权重相同时避免比较 MemoryChunk（不可比较，会 TypeError）
         heap = []
+        seq = itertools.count()
 
         matched_count = 0
         for chunk_id in self._select_candidates(query_tags):
@@ -382,28 +403,30 @@ class MemoryLayerCore:
             wf = self.calc_weight(chunk)
             if wf.final >= min_weight:
                 if len(heap) < limit:
-                    heapq.heappush(heap, (-wf.final, chunk, wf))
+                    heapq.heappush(heap, (-wf.final, next(seq), chunk, wf))
                 elif -wf.final < heap[0][0]:
                     # 当前分数比堆顶高，替换
-                    heapq.heapreplace(heap, (-wf.final, chunk, wf))
+                    heapq.heapreplace(heap, (-wf.final, next(seq), chunk, wf))
 
         # 按权重降序返回
-        result = [(chunk, wf) for _, chunk, wf in sorted(heap)]
+        result = [(chunk, wf) for _, _, chunk, wf in sorted(heap)]
         return result
 
     def get_top(self, limit: int = 20) -> List[Tuple[MemoryChunk, WeightFactors]]:
         """获取当前权重最高的记忆"""
         import heapq
+        import itertools
 
         heap = []
+        seq = itertools.count()
         for chunk in self._store.get_all().values():
             wf = self.calc_weight(chunk)
             if len(heap) < limit:
-                heapq.heappush(heap, (-wf.final, chunk, wf))
+                heapq.heappush(heap, (-wf.final, next(seq), chunk, wf))
             elif -wf.final < heap[0][0]:
-                heapq.heapreplace(heap, (-wf.final, chunk, wf))
+                heapq.heapreplace(heap, (-wf.final, next(seq), chunk, wf))
 
-        return [(chunk, wf) for _, chunk, wf in sorted(heap)]
+        return [(chunk, wf) for _, _, chunk, wf in sorted(heap)]
 
     # ============ Hebbian关联 ============
 
@@ -473,25 +496,21 @@ class MemoryLayerCore:
         if not chunk:
             return
 
-        current_weight = self.calc_weight(chunk).final
-
         if success:
-            # 成功回忆，权重提升
-            # 情绪强度影响提升幅度
+            # 成功回忆：累积正向偏置（情绪强度影响提升幅度），
+            # 偏置直接叠加进 calc_weight 的最终权重，持久生效。
             boost = 0.05 * (1 + feedback_emotion)
-            new_weight = min(1.0, current_weight + boost)
+            chunk.recall_bias = min(0.25, chunk.recall_bias + boost)
             chunk.successful_recall()
             self.total_recall_success += 1
+            # 持续成功的记忆，长期重要性缓慢上升
+            chunk.importance = min(1.0, chunk.importance + 0.01)
         else:
-            # 错误回忆，权重降低
+            # 错误回忆：累积负向偏置，把不可靠的记忆推向降级阈值
             penalty = 0.08 * (1 + abs(feedback_emotion))
-            new_weight = max(0.0, current_weight - penalty)
+            chunk.recall_bias = max(-0.25, chunk.recall_bias - penalty)
             self.total_recall_fail += 1
 
-        # 更新基础重要性（间接影响权重）
-        # 如果持续成功，重要性缓慢上升
-        if success:
-            chunk.importance = min(1.0, chunk.importance + 0.01)
         self._store.put(chunk)
         self._invalidate_weight(chunk_id)
 
