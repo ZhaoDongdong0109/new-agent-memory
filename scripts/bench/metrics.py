@@ -177,7 +177,7 @@ def calculate_all_metrics(
     return {
         f"recall@{k}": recall_at_k(retrieved, expected, k),
         f"precision@{k}": precision_at_k(retrieved, expected, k),
-        f"mrr": mrr(retrieved, expected),
+        "mrr": mrr(retrieved, expected),
         f"ndcg@{k}": ndcg_at_k(retrieved, expected, k),
         f"f1@{k}": f1_at_k(retrieved, expected, k),
         "latency": latency,
@@ -201,9 +201,16 @@ def aggregate_metrics(results: List[Dict[str, float]]) -> Dict[str, float]:
     keys = results[0].keys()
 
     for key in keys:
-        values = [r[key] for r in results if key in r]
-        aggregated[f"mean_{key}"] = sum(values) / len(values) if values else 0.0
-        aggregated[f"min_{key}"] = min(values) if values else 0.0
-        aggregated[f"max_{key}"] = max(values) if values else 0.0
+        # 只聚合数值指标：结果字典里还携带 query/category 等文本字段，
+        # 对字符串求和会直接 TypeError
+        values = [
+            r[key] for r in results
+            if key in r and isinstance(r[key], (int, float)) and not isinstance(r[key], bool)
+        ]
+        if not values:
+            continue
+        aggregated[f"mean_{key}"] = sum(values) / len(values)
+        aggregated[f"min_{key}"] = min(values)
+        aggregated[f"max_{key}"] = max(values)
 
     return aggregated

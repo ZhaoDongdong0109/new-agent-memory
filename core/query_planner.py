@@ -121,6 +121,24 @@ class QueryPlanner:
         # 到 0~1，再混合，比例才是真实的。
         max_rrf = fused[0][1] if fused else 0.0
 
+        # 分数感知融合：纯名次 RRF 会抛弃分数差距——BM25 打 27.6 vs 23.9
+        # （精确关键词命中 vs 模板相似）在名次上只是 1 vs 2，RRF 里只差
+        # 1.6%，容易被其他腿的噪声拉平。把每腿分数 min-max 归一化后按
+        # 腿权重合成，与 RRF 名次分各占一半，既保留名次的稳健性，
+        # 也保留分数的置信度信息。
+        score_component: Dict[str, float] = {}
+        leg_weights = weights if len(weights) == len(rankings) else [1.0] * len(rankings)
+        for ranking, leg_weight in zip(rankings, leg_weights):
+            if not ranking:
+                continue
+            leg_scores = [s for _, s in ranking]
+            lo, hi = min(leg_scores), max(leg_scores)
+            span = hi - lo
+            for doc_id, raw in ranking:
+                norm = (raw - lo) / span if span > 0 else 1.0
+                score_component[doc_id] = score_component.get(doc_id, 0.0) + leg_weight * norm
+        max_component = max(score_component.values()) if score_component else 0.0
+
         results = []
         for chunk_id, rrf_score in fused:
             # 已删除/已降级的 id 可能残留在 BM25/Dense 索引里：
@@ -136,7 +154,12 @@ class QueryPlanner:
             else:
                 weight = 0.1  # 伪遗忘层的默认权重
 
-            relevance = rrf_score / max_rrf if max_rrf > 0 else 0.0
+            rank_relevance = rrf_score / max_rrf if max_rrf > 0 else 0.0
+            score_relevance = (
+                score_component.get(chunk_id, 0.0) / max_component
+                if max_component > 0 else 0.0
+            )
+            relevance = 0.5 * rank_relevance + 0.5 * score_relevance
 
             # 混合分数：70% 相关性 + 30% 记忆权重
             final_score = 0.7 * relevance + 0.3 * weight

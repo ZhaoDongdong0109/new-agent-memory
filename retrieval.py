@@ -247,6 +247,13 @@ class MemoryRetrieval:
         if match:
             ctx.persons.add(match.group(1))
 
+        # 已知人物锚点：记忆库里出现过的人名在查询中出现即提取。
+        # 人名是最强的检索锚点（"小李现在住在哪"必须锁定小李），
+        # 而句式模板无法穷举——用人物索引的键做确定性匹配。
+        for person in self.core.person_index.keys():
+            if person and person in query:
+                ctx.persons.add(person)
+
         # 主题解析：使用统一双语词汇表（core/topic_vocab.py），
         # 扩展出的标签能同时命中中文与英文写入侧的主题
         ctx.topics.update(extract_query_topics(query))
