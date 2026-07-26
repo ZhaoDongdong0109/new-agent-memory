@@ -11,7 +11,7 @@ BM25 词法检索器
 import math
 import re
 from collections import Counter, defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Tuple
 
 
 class BM25Retriever:

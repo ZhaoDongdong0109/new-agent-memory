@@ -9,9 +9,9 @@ ConsolidationEngine - 记忆巩固引擎
 """
 
 import time
-from typing import Dict, List, Optional, Any
+from typing import List, Optional, Any
 
-from core.memory_spec import MemorySpec, ExtractionResult
+from core.memory_spec import MemorySpec
 from core.memory_extractor import MemoryExtractor
 
 

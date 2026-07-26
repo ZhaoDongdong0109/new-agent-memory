@@ -22,7 +22,7 @@ import argparse
 import json
 import sys
 import urllib.request
-from typing import Any, List
+from typing import List
 
 
 def _api_get(hub_url: str, path: str) -> dict:
@@ -82,7 +82,7 @@ def run_status(args: argparse.Namespace) -> int:
         # 获取统计信息
         stats = _api_get(hub_url, "/api/stats")
         agents = stats.get("agents", {})
-        print(f"Hub 状态:")
+        print("Hub 状态:")
         print(f"  Agent:   {agents.get('online', 0)} 在线 / {agents.get('total', 0)} 总计")
         print(f"  频道:    {stats.get('channels', 0)}")
         print(f"  消息:    {stats.get('messages', 0)}")

@@ -7,7 +7,7 @@ and returns text. The returned text should contain a JSON action.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 import json
 import os
 import re

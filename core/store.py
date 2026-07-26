@@ -8,7 +8,7 @@
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Any, Set
+from typing import Dict, Optional, Any, Set
 
 
 class MemoryStore(ABC):

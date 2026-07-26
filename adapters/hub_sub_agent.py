@@ -21,7 +21,6 @@ from __future__ import annotations
 import json
 import os
 import random
-import sys
 import time
 import urllib.request
 from datetime import datetime
@@ -123,14 +122,14 @@ def write_task_file(task: str, sender: str):
 def generate_chat_reply(content: str, sender: str) -> str:
     """生成简短友好的聊天回复"""
     replies = [
-        f"收到！有什么我可以帮忙的吗？",
-        f"嗯嗯，了解了~",
-        f"好的，我在听！",
-        f"收到！有什么需要随时说~",
-        f"嗯，明白了！",
-        f"好的，随时找我~",
-        f"收到！有什么可以帮你的吗？",
-        f"嗯嗯，我在呢~",
+        "收到！有什么我可以帮忙的吗？",
+        "嗯嗯，了解了~",
+        "好的，我在听！",
+        "收到！有什么需要随时说~",
+        "嗯，明白了！",
+        "好的，随时找我~",
+        "收到！有什么可以帮你的吗？",
+        "嗯嗯，我在呢~",
     ]
     return random.choice(replies)
 
@@ -161,7 +160,7 @@ def main():
     except Exception:
         pass
 
-    print(f"[Hub Sub-Agent] 启动")
+    print("[Hub Sub-Agent] 启动")
     print(f"[Hub Sub-Agent] Hub 地址: {HUB_URL}")
     print(f"[Hub Sub-Agent] Agent ID: {AGENT_ID}")
     print(f"[Hub Sub-Agent] 任务文件: {TASK_FILE}")

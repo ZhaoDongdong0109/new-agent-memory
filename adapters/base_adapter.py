@@ -23,16 +23,19 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import threading
 import time
 import urllib.request
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 # Bypass proxy for localhost
 _proxy_handler = urllib.request.ProxyHandler({})
 _opener = urllib.request.build_opener(_proxy_handler)
+
+
+class HubConnectionError(ConnectionError):
+    """连接 hub 失败时抛出，供调用方决定如何处理（而不是直接退出进程）。"""
 
 
 class BaseAdapter(ABC):
@@ -251,7 +254,9 @@ class BaseAdapter(ABC):
             return data["id"]
         except Exception as e:
             print(f"[{self.name}] 注册失败: {e}")
-            sys.exit(1)
+            raise HubConnectionError(
+                f"无法连接到 hub ({self.hub_url}): {e}"
+            ) from e
 
     def _update_status(self, status: str):
         """更新 agent 状态"""

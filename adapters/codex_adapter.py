@@ -29,7 +29,7 @@ import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from adapters.base_adapter import BaseAdapter
+from adapters.base_adapter import BaseAdapter, HubConnectionError
 
 try:
     from hub_data.queue_protocol import QueueProtocol
@@ -67,13 +67,13 @@ class CodexAdapter(BaseAdapter):
     def _print_help(self):
         """打印帮助信息"""
         print(f"[{self.name}] 命令：")
-        print(f"  :help          - 显示帮助")
-        print(f"  :channels      - 列出频道")
-        print(f"  :agents        - 列出 agent")
-        print(f"  :switch <id>   - 切换频道")
-        print(f"  :quit          - 退出")
-        print(f"  @<name> <msg>  - @提及某个 agent")
-        print(f"  其他内容       - 发送到当前频道")
+        print("  :help          - 显示帮助")
+        print("  :channels      - 列出频道")
+        print("  :agents        - 列出 agent")
+        print("  :switch <id>   - 切换频道")
+        print("  :quit          - 退出")
+        print("  @<name> <msg>  - @提及某个 agent")
+        print("  其他内容       - 发送到当前频道")
         print()
 
     def _start_input_listener(self):
@@ -171,7 +171,6 @@ class CodexAdapter(BaseAdapter):
         sender = msg.get("sender_name", "unknown")
         content = msg.get("content", "")
         channel = msg.get("channel_id", "general")
-        message_type = msg.get("message_type", "text")
 
         # 打印消息
         timestamp = datetime.fromtimestamp(msg.get("created_at", 0)).strftime("%H:%M:%S")
@@ -270,7 +269,11 @@ def main(argv: List[str] = None) -> int:
     args = parser.parse_args(argv)
 
     agent = CodexAdapter(name=args.name, hub_url=args.hub)
-    agent.connect()
+    try:
+        agent.connect()
+    except HubConnectionError as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return 1
 
     try:
         # 保持运行

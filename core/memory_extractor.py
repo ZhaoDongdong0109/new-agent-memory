@@ -7,7 +7,7 @@ MemoryExtractor - 从 episode 提取结构化记忆
 """
 
 import time
-from typing import Callable, Dict, List, Optional, Any
+from typing import Callable, List, Optional
 
 from core.memory_spec import MemorySpec, ExtractionResult
 from core.entity_extractor import EntityExtractor
@@ -149,11 +149,11 @@ class MemoryExtractor:
             content_parts.append(f"原因：{action.rationale}")
 
         if result.success:
-            content_parts.append(f"结果：成功")
+            content_parts.append("结果：成功")
             if result.output:
                 content_parts.append(f"输出：{result.output[:200]}")
         else:
-            content_parts.append(f"结果：失败")
+            content_parts.append("结果：失败")
             if result.output:
                 content_parts.append(f"错误：{result.output[:200]}")
 

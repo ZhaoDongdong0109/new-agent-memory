@@ -55,8 +55,6 @@ class WebhookAdapter(PollingAdapter):
     def register(self) -> str:
         """Register with the hub and provide the callback URL."""
         agent_id = super().register()
-        # Store callback URL in agent metadata
-        callback_url = f"http://localhost:{self.callback_port}/callback"
         self._post(f"/api/agents/{agent_id}/heartbeat", {
             "status": "online",
         })

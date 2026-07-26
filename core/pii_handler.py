@@ -11,7 +11,7 @@ PII 处理器
 """
 
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 
 class PIIHandler:

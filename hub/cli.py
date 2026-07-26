@@ -73,7 +73,7 @@ def run_status(args: argparse.Namespace) -> int:
         with urllib.request.urlopen(url, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         agents = data.get("agents", {})
-        print(f"Hub status:")
+        print("Hub status:")
         print(f"  Agents:   {agents.get('online', 0)} online / {agents.get('total', 0)} total")
         print(f"  Channels: {data.get('channels', 0)}")
         print(f"  Messages: {data.get('messages', 0)}")

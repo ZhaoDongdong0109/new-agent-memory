@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 
 class AuditLogger:
@@ -194,17 +194,27 @@ class AuditLogger:
         self.logger.info(json.dumps(event, ensure_ascii=False))
 
     def _setup_logger(self) -> logging.Logger:
-        """设置日志器"""
-        logger = logging.getLogger("audit")
-        logger.setLevel(logging.INFO)
+        """设置日志器
 
-        # 避免重复添加 handler
-        if logger.handlers:
-            return logger
+        每个日志文件使用独立的 logger 名称，避免多个 AuditLogger 实例
+        （指向不同文件）共享同一个 handler 而写错文件。
+        """
+        # 以日志文件的绝对路径区分 logger，保证不同文件之间彼此隔离。
+        target = os.path.abspath(self.log_file)
+        logger = logging.getLogger(f"audit.{target}")
+        logger.setLevel(logging.INFO)
+        # 审计日志独立落盘，不向 root logger 传播（避免重复输出）。
+        logger.propagate = False
+
+        # 避免为同一个文件重复添加 handler。
+        for existing in logger.handlers:
+            if isinstance(existing, logging.FileHandler) and \
+                    os.path.abspath(getattr(existing, "baseFilename", "")) == target:
+                return logger
 
         # 文件 handler
-        os.makedirs(os.path.dirname(self.log_file) or ".", exist_ok=True)
-        handler = logging.FileHandler(self.log_file, encoding="utf-8")
+        os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+        handler = logging.FileHandler(target, encoding="utf-8")
 
         if self.json_format:
             # JSON 格式不需要 formatter

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import time
-import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from typing import Any, Optional
@@ -345,12 +344,12 @@ def start_hub(
 
     server = ThreadingHTTPServer((host, port), HubHandler)
 
-    print(f"Agent Communication Hub started")
+    print("Agent Communication Hub started")
     print(f"  Web UI:  http://localhost:{port}/ui")
     print(f"  API:     http://localhost:{port}/api")
     print(f"  SSE:     http://localhost:{port}/api/events")
     if memory_bridge:
-        print(f"  Memory:  integration enabled")
+        print("  Memory:  integration enabled")
     print()
 
     # Save on shutdown

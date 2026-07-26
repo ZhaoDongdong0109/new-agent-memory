@@ -14,9 +14,9 @@ import time
 from memory_chunk import MemoryChunk, MemoryLayer
 from memory_layer_core import MemoryLayerCore
 from forgotten_layer import ForgottenLayer
-from retrieval import MemoryRetrieval, QueryContext, ReconstructionResult, ReviewResult
+from retrieval import MemoryRetrieval, ReconstructionResult, ReviewResult
 from core.weight_system import MemoryType
-from core.persona_layer import PersonaLayer, BehaviorType
+from core.persona_layer import PersonaLayer
 from core.attention_system import AttentionOS, FocusWorkspace, Goal, ProcedureMemory
 from core.agent_system import CognitiveAgent
 from core.cognitive_state import ActionExpectation, CognitiveFrame, CognitiveState, ReflectionNote
@@ -623,7 +623,6 @@ class HumanLikeMemorySystem:
     
     def _review_chunks(self, chunks, assembled, ctx):
         """审阅碎片"""
-        import math
         confidence = 0.0
         
         if len(chunks) == 1:

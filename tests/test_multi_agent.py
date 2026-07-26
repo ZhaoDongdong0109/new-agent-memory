@@ -20,6 +20,8 @@ import threading
 import urllib.request
 from typing import Any, Dict, List
 
+import pytest
+
 # 添加项目根目录到 path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -30,6 +32,23 @@ from adapters.codex_adapter import CodexAdapter
 # 测试配置
 HUB_URL = "http://localhost:8420"
 TEST_CHANNEL = "test_multi_agent"
+
+
+def _hub_available() -> bool:
+    """检测 hub 服务器是否在运行。这些是集成测试，需要一个真实的 hub。"""
+    try:
+        with urllib.request.urlopen(HUB_URL + "/api/stats", timeout=2):
+            return True
+    except Exception:
+        return False
+
+
+# 没有运行中的 hub 时跳过整个模块，而不是让集成测试失败。
+# 运行方式：先 `python -m hub.cli start`，再执行 pytest。
+pytestmark = pytest.mark.skipif(
+    not _hub_available(),
+    reason="需要运行中的 hub 服务器 (python -m hub.cli start)",
+)
 
 
 def _api_get(path: str) -> Dict[str, Any]:
