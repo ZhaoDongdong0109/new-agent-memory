@@ -23,6 +23,7 @@ import contextlib
 import json
 import os
 import sys
+import time
 
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -270,6 +271,113 @@ class MemoryMCPServer:
                         "type": "object",
                         "properties": {}
                     }
+                },
+                {
+                    "name": "memory_explain",
+                    "description": (
+                        "Explain WHY a memory ranks where it does: full ACT-R "
+                        "activation breakdown (retention, per-factor weights, "
+                        "recall feedback bias), layer/lifecycle state, "
+                        "supersession links, and strongest associations. "
+                        "Use the memory id returned by memory_search."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "memory_id": {
+                                "type": "string",
+                                "description": "Memory id (mem_...)"
+                            }
+                        },
+                        "required": ["memory_id"]
+                    }
+                },
+                {
+                    "name": "memory_history",
+                    "description": (
+                        "Show the bi-temporal supersession chain of a fact: "
+                        "current value plus every superseded historical value "
+                        "with validity periods ('used to live in Lisbon')."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "memory_id": {
+                                "type": "string",
+                                "description": "Any memory id on the chain"
+                            }
+                        },
+                        "required": ["memory_id"]
+                    }
+                },
+                {
+                    "name": "memory_sleep",
+                    "description": (
+                        "Run one deterministic sleep-consolidation cycle: "
+                        "related episodic memories are abstracted into a "
+                        "slow-decaying gist (sources archived but cue-wakeable). "
+                        "Returns a full audit report."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "memory_focus",
+                    "description": (
+                        "Goal-driven attention workspace: given the current "
+                        "query/task, returns what the system should be "
+                        "thinking about right now (relevant memories, "
+                        "triggered procedures, active goal), with explainable "
+                        "scores. Different from memory_search: answers "
+                        "'what should I think about', not 'what do I remember'."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Current task or question"
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                },
+                {
+                    "name": "memory_feedback",
+                    "description": (
+                        "Tell the memory system whether its last recall for a "
+                        "query was right or wrong. Confirmed memories gain "
+                        "persistent weight; corrected ones sink toward "
+                        "forgetting. This is how the system learns from use."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The query that was answered"
+                            },
+                            "accepted": {
+                                "type": "boolean",
+                                "description": "true = recall was correct"
+                            }
+                        },
+                        "required": ["query", "accepted"]
+                    }
+                },
+                {
+                    "name": "memory_maintain",
+                    "description": (
+                        "Run memory maintenance: sleep-consolidation if due, "
+                        "demote decayed memories to the pseudo-forgotten "
+                        "layer, clean up. Normally automatic; call to force."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
                 }
             ]
         }
@@ -290,6 +398,18 @@ class MemoryMCPServer:
                 return self._add(arguments)
             elif tool_name == "memory_stats":
                 return self._stats()
+            elif tool_name == "memory_explain":
+                return self._explain(arguments)
+            elif tool_name == "memory_history":
+                return self._history(arguments)
+            elif tool_name == "memory_sleep":
+                return self._sleep()
+            elif tool_name == "memory_focus":
+                return self._focus(arguments)
+            elif tool_name == "memory_feedback":
+                return self._feedback(arguments)
+            elif tool_name == "memory_maintain":
+                return self._maintain()
             else:
                 return {
                     "content": [
@@ -306,34 +426,192 @@ class MemoryMCPServer:
             }
 
     def _search(self, args: dict) -> dict:
-        """检索记忆"""
+        """检索记忆（返回 id 供 memory_explain / memory_history 溯源）"""
         query = args.get("query", "")
         result = self.memory.retrieve(query, allow_forgotten=True)
 
         if result.success:
-            memories = []
+            lines = [
+                f"Found {len(result.chunks)} memories "
+                f"(path={result.retrieval_path}, confidence={result.confidence:.2f})"
+            ]
+            if result.review_note:
+                lines.append(f"note: {result.review_note}")
+            lines.append("")
             for chunk in result.chunks[:5]:
-                memories.append({
-                    "content": chunk.content[:200],
-                    "importance": chunk.importance,
-                    "topics": list(chunk.topics)[:5],
-                })
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"Found {len(result.chunks)} memories:\n\n" +
-                                "\n---\n".join(
-                                    f"[{m['importance']:.1f}] {m['content']}"
-                                    for m in memories
-                                )
-                    }
-                ]
-            }
+                topics = ",".join(list(chunk.topics)[:4])
+                lines.append(
+                    f"[{chunk.id}] (imp={chunk.importance:.1f}"
+                    + (f", topics={topics}" if topics else "")
+                    + f") {chunk.content[:200]}"
+                )
+            return {"content": [{"type": "text", "text": "\n".join(lines)}]}
         else:
+            # 可审计弃答：把拒答理由原样带给客户端
+            text = "No relevant memories found."
+            if result.review_note:
+                text += f" ({result.review_note})"
+            return {"content": [{"type": "text", "text": text}]}
+
+    def _find_chunk(self, memory_id: str):
+        """核心层优先，其次伪遗忘层"""
+        chunk = self.memory.core.get(memory_id)
+        if chunk is not None:
+            return chunk, "core"
+        chunk = self.memory.forgotten.get(memory_id)
+        if chunk is not None:
+            return chunk, "forgotten"
+        return None, None
+
+    def _explain(self, args: dict) -> dict:
+        """可解释性：这条记忆为什么排在这里"""
+        memory_id = args.get("memory_id", "")
+        chunk, layer = self._find_chunk(memory_id)
+        if chunk is None:
             return {
-                "content": [{"type": "text", "text": "No relevant memories found."}]
+                "content": [{"type": "text", "text": f"Memory not found: {memory_id}"}],
+                "isError": True,
             }
+
+        from core.weight_system import actr_decay
+        wf = self.memory.core.calc_weight(chunk)
+
+        def _ts(value):
+            return time.strftime("%Y-%m-%d %H:%M", time.localtime(value)) if value else "-"
+
+        report = {
+            "id": chunk.id,
+            "layer": layer,
+            "memory_type": getattr(chunk.memory_type, "value", str(chunk.memory_type)),
+            "content_preview": chunk.content[:120],
+            "lifecycle": {
+                "created_at": _ts(chunk.created_at),
+                "last_accessed": _ts(chunk.last_accessed),
+                "access_count": chunk.access_count,
+                "successful_recalls": chunk.successful_recall_count,
+                "valid_at": _ts(chunk.valid_at),
+                "invalid_at": _ts(chunk.invalid_at),
+                "superseded_by": chunk.metadata.get("superseded_by"),
+                "supersedes": chunk.parent_id,
+                "consolidated_into": chunk.metadata.get("consolidated_into"),
+            },
+            "actr_activation": {
+                "B": round(wf.activation, 3),
+                "retention_P": round(wf.retention, 4),
+                "decay_d_for_type": actr_decay(chunk.memory_type),
+            },
+            "weight_factors": {
+                "emotion_boost": round(wf.emotion_boost, 4),
+                "association_density": round(wf.association_density, 4),
+                "importance": round(wf.importance_base, 4),
+                "connection": round(wf.connection_boost, 4),
+                "recall_bias": round(wf.recall_bias, 4),
+                "final_weight": round(wf.final, 4),
+            },
+            "encoding_surprise": chunk.metadata.get("encoding_surprise"),
+            "top_associations": [
+                {"id": aid, "strength": round(s, 3)}
+                for aid, s in sorted(
+                    chunk.associations.items(), key=lambda x: -x[1]
+                )[:5]
+            ],
+        }
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps(report, indent=2, ensure_ascii=False),
+            }]
+        }
+
+    def _history(self, args: dict) -> dict:
+        """双时态取代链：一个事实的完整版本历史"""
+        memory_id = args.get("memory_id", "")
+        chunk, _layer = self._find_chunk(memory_id)
+        if chunk is None:
+            return {
+                "content": [{"type": "text", "text": f"Memory not found: {memory_id}"}],
+                "isError": True,
+            }
+
+        # 走到链头（最新版本）
+        head = chunk
+        seen = {head.id}
+        while head.metadata.get("superseded_by"):
+            nxt, _ = self._find_chunk(head.metadata["superseded_by"])
+            if nxt is None or nxt.id in seen:
+                break
+            head = nxt
+            seen.add(head.id)
+
+        # 从链头沿 parent_id 回溯全部历史
+        def _ts(value):
+            return time.strftime("%Y-%m-%d %H:%M", time.localtime(value)) if value else "?"
+
+        lines = []
+        node = head
+        seen = set()
+        while node is not None and node.id not in seen:
+            seen.add(node.id)
+            if node.invalid_at is None:
+                status = "CURRENT"
+                period = f"since {_ts(node.valid_at or node.created_at)}"
+            else:
+                status = "superseded"
+                period = f"{_ts(node.valid_at or node.created_at)} -> {_ts(node.invalid_at)}"
+            lines.append(f"[{status}] ({period}) [{node.id}] {node.content[:120]}")
+            node = self._find_chunk(node.parent_id)[0] if node.parent_id else None
+
+        if len(lines) == 1:
+            lines.append("(no supersession history — this fact was never updated)")
+        return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+    def _sleep(self) -> dict:
+        """执行一次睡眠巩固，返回审计报告"""
+        report = self.memory.sleep()
+        lines = [f"Sleep cycle done: {report.summary()}"]
+        for detail in report.details:
+            lines.append(
+                f"\ngist {detail['gist_id']} <- {detail['cluster_size']} episodes "
+                f"({', '.join(detail['source_ids'])})"
+            )
+        if not report.gists_created:
+            lines.append("(no clusters large enough to consolidate)")
+        return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+    def _focus(self, args: dict) -> dict:
+        """注意力工作区：现在该想什么"""
+        query = args.get("query", "")
+        workspace = self.memory.focus(query)
+        return {
+            "content": [{"type": "text", "text": workspace.to_prompt_context()}]
+        }
+
+    def _feedback(self, args: dict) -> dict:
+        """回忆反馈：确认/纠正上一次检索"""
+        query = args.get("query", "")
+        accepted = bool(args.get("accepted", True))
+        self.memory.retrieval.feedback(query, accepted=accepted)
+        verdict = "confirmed (weights raised)" if accepted else "corrected (weights lowered)"
+        return {
+            "content": [{"type": "text", "text": f"Feedback recorded: {verdict}."}]
+        }
+
+    def _maintain(self) -> dict:
+        """强制维护：睡眠巩固（如到期）+ 降级 + 清理"""
+        core_before = len(self.memory.core)
+        forgotten_before = len(self.memory.forgotten)
+        self.memory.maintain()
+        core_after = len(self.memory.core)
+        forgotten_after = len(self.memory.forgotten)
+        return {
+            "content": [{
+                "type": "text",
+                "text": (
+                    f"Maintenance done. core: {core_before} -> {core_after}, "
+                    f"forgotten: {forgotten_before} -> {forgotten_after}"
+                ),
+            }]
+        }
 
     def _add(self, args: dict) -> dict:
         """添加记忆（支持 LLM 增强抽取）"""
