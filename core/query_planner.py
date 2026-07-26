@@ -122,21 +122,27 @@ class QueryPlanner:
         max_rrf = fused[0][1] if fused else 0.0
 
         results = []
-        for chunk_id, rrf_score in fused[:limit * 2]:
+        for chunk_id, rrf_score in fused:
+            # 已删除/已降级的 id 可能残留在 BM25/Dense 索引里：
+            # 跳过而不占用结果名额，否则残留 id 会把真实结果挤出窗口
             chunk = self._get_chunk(chunk_id)
-            if chunk:
-                # 计算最终权重
-                if self.core and chunk.layer == MemoryLayer.CORE:
-                    weight_factors = self.core.calc_weight(chunk)
-                    weight = weight_factors.final
-                else:
-                    weight = 0.1  # 伪遗忘层的默认权重
+            if chunk is None:
+                continue
 
-                relevance = rrf_score / max_rrf if max_rrf > 0 else 0.0
+            # 计算最终权重
+            if self.core and chunk.layer == MemoryLayer.CORE:
+                weight_factors = self.core.calc_weight(chunk)
+                weight = weight_factors.final
+            else:
+                weight = 0.1  # 伪遗忘层的默认权重
 
-                # 混合分数：70% 相关性 + 30% 记忆权重
-                final_score = 0.7 * relevance + 0.3 * weight
-                results.append((chunk, final_score))
+            relevance = rrf_score / max_rrf if max_rrf > 0 else 0.0
+
+            # 混合分数：70% 相关性 + 30% 记忆权重
+            final_score = 0.7 * relevance + 0.3 * weight
+            results.append((chunk, final_score))
+            if len(results) >= limit * 2:
+                break
 
         # 排序并返回
         results.sort(key=lambda x: x[1], reverse=True)
@@ -170,8 +176,10 @@ class QueryPlanner:
         if not any(key in query_tags for key in self._ANCHOR_KEYS):
             return []
 
-        # 使用 core 的 _select_candidates 方法
-        candidate_ids = self.core._select_candidates(query_tags)
+        # 使用 core 的 _select_candidates 方法。
+        # 禁用扫描回退：锚点存在但索引零命中时必须返回空，
+        # 否则整个存储的前 200 条会被当作"命中"灌进 RRF 最大权重腿。
+        candidate_ids = self.core._select_candidates(query_tags, allow_scan_fallback=False)
 
         # 按记忆权重排序，让 RRF 的名次有真实含义
         scored = []

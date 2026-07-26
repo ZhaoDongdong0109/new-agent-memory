@@ -609,9 +609,9 @@ class HumanLikeMemorySystem:
         forgotten_results = self.forgotten.try_wake(ctx.to_tags())
 
         if forgotten_results:
-            chunks = [c for c, _ in forgotten_results]
-            # 锚点足够强的唤醒记忆提升回核心层（遗忘-唤醒闭环）
-            self.retrieval.promote_woken(forgotten_results)
+            # 锚点足够强的唤醒记忆提升回核心层（遗忘-唤醒闭环）。
+            # 必须使用返回值：被提升条目已替换为核心层新对象
+            chunks = self.retrieval.promote_woken(forgotten_results)
             assembled = self._assemble_chunks(chunks, ctx)
             review_result, confidence = self._review_chunks(chunks, assembled, ctx)
             

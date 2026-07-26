@@ -16,9 +16,8 @@ import json
 import os
 import sys
 import time
-import threading
 import urllib.request
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import pytest
 
@@ -150,7 +149,7 @@ def test_mention():
     last_msg = codex_received[-1]
     assert "@TestCodex2" in last_msg["content"], f"消息应该包含 @提及，实际内容: {last_msg['content']}"
 
-    print(f"✅ Codex 收到 @提及消息")
+    print("✅ Codex 收到 @提及消息")
 
     # 断开连接
     claude.disconnect()
@@ -198,7 +197,7 @@ def test_task():
     last_task = codex_tasks[-1]
     assert "重构" in last_task["content"], f"任务内容应该包含 '重构'，实际内容: {last_task['content']}"
 
-    print(f"✅ Codex 收到任务")
+    print("✅ Codex 收到任务")
 
     # 断开连接
     claude.disconnect()
@@ -247,7 +246,7 @@ def test_correction():
     last_correction = codex_corrections[-1]
     assert "除零" in last_correction["content"], f"纠错内容应该包含 '除零'，实际内容: {last_correction['content']}"
 
-    print(f"✅ Codex 收到纠错")
+    print("✅ Codex 收到纠错")
 
     # 断开连接
     claude.disconnect()
