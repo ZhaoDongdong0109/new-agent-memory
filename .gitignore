@@ -10,3 +10,5 @@ memory_data/
 hub_data/messages/
 audit.log
 *.whl
+coverage.xml
+.coverage

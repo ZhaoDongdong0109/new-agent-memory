@@ -249,7 +249,7 @@ class HumanLikeMemorySystem:
             # 记录 PII 检测审计
             if self.audit_logger:
                 import hashlib
-                text_hash = hashlib.md5(content.encode()).hexdigest()[:16]
+                text_hash = hashlib.md5(content.encode(), usedforsecurity=False).hexdigest()[:16]
                 self.audit_logger.log_pii_detection(
                     text_hash=text_hash,
                     pii_types=pii_types,
@@ -431,7 +431,7 @@ class HumanLikeMemorySystem:
             # 记录 PII 检测审计
             if self.audit_logger:
                 import hashlib
-                text_hash = hashlib.md5(text.encode()).hexdigest()[:16]
+                text_hash = hashlib.md5(text.encode(), usedforsecurity=False).hexdigest()[:16]
                 self.audit_logger.log_pii_detection(
                     text_hash=text_hash,
                     pii_types=pii_types,
@@ -661,7 +661,7 @@ class HumanLikeMemorySystem:
         # 记录检索审计
         if self.audit_logger:
             import hashlib
-            query_hash = hashlib.md5(query.encode()).hexdigest()[:16]
+            query_hash = hashlib.md5(query.encode(), usedforsecurity=False).hexdigest()[:16]
             self.audit_logger.log_retrieval(
                 user_id=user_id,
                 query_hash=query_hash,
