@@ -522,6 +522,12 @@ class MemoryMCPServer:
                 "B": round(wf.activation, 3),
                 "retention_P": round(wf.retention, 4),
                 "decay_d_for_type": actr_decay(chunk.memory_type),
+                # Pavlik 间隔效应：最近各次使用事件的衰减速率
+                # （复习时激活越高越接近上限，越低越接近类型基线）
+                "event_decays_recent": [
+                    round(dj, 3) if dj is not None else None
+                    for dj in chunk.access_decays[-5:]
+                ],
             },
             "weight_factors": {
                 "emotion_boost": round(wf.emotion_boost, 4),

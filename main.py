@@ -486,12 +486,16 @@ class HumanLikeMemorySystem:
         if check_duplicate:
             existing = self._find_similar_memory(text)
             if existing:
-                # 更新现有记忆的访问统计
-                existing.access()
+                # 更新现有记忆的访问统计。重复灌入正是"高激活时的
+                # 再次复习"，必须带 Pavlik 事件衰减——否则突击式
+                # 重复存储每次都记下最耐久的基线痕迹，间隔效应在
+                # 这个入口被系统性绕过（对抗审查发现）。
+                existing.access(decay=self.core._rehearsal_decay(existing))
                 existing.successful_recall()
                 existing.version += 1
                 existing.updated_at = time.time()
                 self.core._store.put(existing)
+                self.core._invalidate_weight(existing.id)
 
                 # 记录更新审计
                 if self.audit_logger:

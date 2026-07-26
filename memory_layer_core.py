@@ -171,23 +171,46 @@ class MemoryLayerCore:
         # 一起"老化"，而不是留下一个未来时间戳撑高激活。
         anchor = max(chunk.last_accessed, chunk.created_at)
         retained = [min(t, anchor) for t in chunk.access_log] or [chunk.created_at]
+
+        # Pavlik 间隔效应：每次使用事件用自己的衰减速率（复习时
+        # 激活越高衰减越快）。access_decays 与 access_log 右对齐；
+        # 缺失/None（老数据、直接调用）回退到类型基线 d。关联减缓
+        # 因子对逐事件衰减同样生效（等比缩放）。
+        assoc_factor = d / actr_decay(chunk.memory_type) if actr_decay(chunk.memory_type) else 1.0
+        decays = list(getattr(chunk, "access_decays", []) or [])
+        if len(decays) < len(retained):
+            decays = [None] * (len(retained) - len(decays)) + decays
+        else:
+            decays = decays[-len(retained):]
         activation_sum = sum(
-            max(self._MIN_EVENT_AGE, now - t) ** (-d) for t in retained
+            max(self._MIN_EVENT_AGE, now - t)
+            ** (-(max(0.2, dj * assoc_factor) if dj is not None else d))
+            for t, dj in zip(retained, decays)
         )
 
-        # Petrov 尾部近似：未保留的更早使用
+        # Petrov 尾部近似：未保留的更早使用。
+        # 尾部指数用被裁剪事件的衰减均值而不是类型基线 d——否则
+        # 密集复习把事件推入尾部即逃脱间隔惩罚（对抗审查实测：
+        # 20 次突击后 91% 的激活和来自未受罚的尾部）。没有逐事件
+        # 记录的老事件按基线 d 记（与 None 回退语义一致）。
         total_events = max(chunk.access_count + 1, len(retained))
         older = total_events - len(retained)
         if older > 0:
+            evicted_n = getattr(chunk, "evicted_decay_count", 0)
+            evicted_sum = getattr(chunk, "evicted_decay_sum", 0.0)
+            known = min(evicted_n, older)
+            known_mean = (evicted_sum / evicted_n) if evicted_n else d
+            tail_d = (known * known_mean * assoc_factor + (older - known) * d) / older
+            tail_d = min(0.95, max(0.2, tail_d))
             lifetime = max(now - chunk.created_at, self._MIN_EVENT_AGE)
             oldest_kept = max(now - retained[0], self._MIN_EVENT_AGE)
             if lifetime > oldest_kept + 1.0:
                 activation_sum += older * (
-                    (lifetime ** (1 - d) - oldest_kept ** (1 - d))
-                    / ((1 - d) * (lifetime - oldest_kept))
+                    (lifetime ** (1 - tail_d) - oldest_kept ** (1 - tail_d))
+                    / ((1 - tail_d) * (lifetime - oldest_kept))
                 )
             else:
-                activation_sum += older * oldest_kept ** (-d)
+                activation_sum += older * oldest_kept ** (-tail_d)
 
         return math.log(max(activation_sum, 1e-12))
 
@@ -432,11 +455,22 @@ class MemoryLayerCore:
         chunk = self._store.get(chunk_id)
         if not chunk:
             return None
-        chunk.access()
+        chunk.access(decay=self._rehearsal_decay(chunk))
         # 必须写回：SQLite 后端的 get() 返回副本，不写回则访问统计静默丢失
         self._store.put(chunk)
         self._invalidate_weight(chunk.id)
         return chunk, self.calc_weight(chunk)
+
+    def _rehearsal_decay(self, chunk: MemoryChunk) -> float:
+        """本次使用事件的衰减速率（Pavlik 间隔效应）
+
+        以访问瞬间的激活水平定衰减：刚用过就再用（激活高）的
+        痕迹衰减快，快忘了才复习（激活近阈值）的痕迹最耐久。
+        """
+        from core.weight_system import actr_decay, pavlik_event_decay
+        import time as _time
+        activation = self._base_level_activation(chunk, _time.time())
+        return pavlik_event_decay(activation, actr_decay(chunk.memory_type))
 
     def remove(self, chunk_id: str) -> Optional[MemoryChunk]:
         """删除记忆"""
@@ -555,7 +589,7 @@ class MemoryLayerCore:
         for chunk_id in chunk_ids:
             chunk = self._store.get(chunk_id)
             if chunk:
-                chunk.access()
+                chunk.access(decay=self._rehearsal_decay(chunk))
                 self._store.put(chunk)
                 self._invalidate_weight(chunk_id)
 
