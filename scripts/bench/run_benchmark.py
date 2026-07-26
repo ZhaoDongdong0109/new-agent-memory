@@ -16,8 +16,8 @@ import sys
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, project_root)
 
-from scripts.bench.benchmark_runner import BenchmarkRunner, load_dataset
-from main import HumanLikeMemorySystem
+from scripts.bench.benchmark_runner import BenchmarkRunner, load_dataset  # noqa: E402
+from main import HumanLikeMemorySystem  # noqa: E402
 
 
 def create_test_memories(memory_system, num_memories=100):
