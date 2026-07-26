@@ -21,10 +21,15 @@ from memory_chunk import MemoryChunk, MemoryLayer
 
 @dataclass
 class WeightFactors:
-    """权重因子分解"""
-    time_decay: float = 0.0
+    """权重因子分解（完整可解释：每个数字都能溯源）"""
+    # ACT-R 基线激活 B = ln(Σ t^-d)，以及映射后的保持率 P
+    activation: float = 0.0
+    retention: float = 0.0
+    # 解释性指标（不直接参与 final，供审计展示）
+    time_decay: float = 0.0     # 等于 retention（历史字段名，保持兼容）
     frequency: float = 0.0
     recency: float = 0.0
+    # 静态因子（被 retention 门控）
     emotion_boost: float = 0.0
     association_density: float = 0.0
     importance_base: float = 0.0
@@ -136,47 +141,100 @@ class MemoryLayerCore:
 
     # ============ 权重计算 ============
 
+    # ACT-R 激活计算中 t 的最小值：一分钟粒度，
+    # 避免"一秒前刚访问"产生病态激活尖峰
+    _MIN_EVENT_AGE = 60.0
+
+    def _base_level_activation(self, chunk: MemoryChunk, now: float) -> float:
+        """
+        ACT-R 基线激活 B = ln(Σ_j t_j^-d)，Petrov O(k) 混合近似。
+
+        - t_j: 距第 j 次使用的秒数（access_log 精确保留最近 k 次，
+          编码事件算第一次使用）
+        - 更早的 (n-k) 次使用用均匀分布积分近似，落在
+          [创建时间, 最旧保留时间戳] 区间上
+        - d 按记忆类型分层（故事最持久），关联强度进一步减缓衰减
+          （原 assoc_stability 思想，如今作用于 d 而不是独立通道）
+        """
+        from core.weight_system import actr_decay
+
+        d = actr_decay(chunk.memory_type)
+        # 关联减缓衰减，但必须渐进且有上限（10%）：
+        # 上限过大时，强关联记忆的保持率一年后仍在阈值之上，
+        # 关联又变回了"永久权重下限"（此前已修复过一次的缺陷类别）
+        assoc_strength = sum(chunk.associations.values())
+        d = max(0.2, d * (1.0 - min(0.10, assoc_strength * 0.01)))
+
+        # 一致性钳制：使用事件不可能晚于 last_accessed。
+        # 正常路径下 access() 同步更新两者；测试/迁移直接回拨
+        # created_at/last_accessed 模拟老化时，这个钳制让 access_log
+        # 一起"老化"，而不是留下一个未来时间戳撑高激活。
+        anchor = max(chunk.last_accessed, chunk.created_at)
+        retained = [min(t, anchor) for t in chunk.access_log] or [chunk.created_at]
+        activation_sum = sum(
+            max(self._MIN_EVENT_AGE, now - t) ** (-d) for t in retained
+        )
+
+        # Petrov 尾部近似：未保留的更早使用
+        total_events = max(chunk.access_count + 1, len(retained))
+        older = total_events - len(retained)
+        if older > 0:
+            lifetime = max(now - chunk.created_at, self._MIN_EVENT_AGE)
+            oldest_kept = max(now - retained[0], self._MIN_EVENT_AGE)
+            if lifetime > oldest_kept + 1.0:
+                activation_sum += older * (
+                    (lifetime ** (1 - d) - oldest_kept ** (1 - d))
+                    / ((1 - d) * (lifetime - oldest_kept))
+                )
+            else:
+                activation_sum += older * oldest_kept ** (-d)
+
+        return math.log(max(activation_sum, 1e-12))
+
     def calc_weight(self, chunk: MemoryChunk) -> WeightFactors:
-        """计算记忆碎片权重"""
+        """
+        计算记忆碎片权重。
+
+        记忆强度核心是 ACT-R 基线激活（30 年认知科学验证的方程，
+        取代此前手调的 time_decay/frequency/recency 三因子）：
+
+            B = ln(Σ t^-d)                     幂律遗忘 + 频率 + 近因
+            P = 1/(1+exp(-(B-τ)/s))            保持率（0~1）
+            final = W_r * P
+                  + P * (情绪 + 重要性 + 连接 + 关联密度)   # 门控
+                  + recall_bias                             # 反馈
+
+        静态因子被 P 门控：不被使用的记忆无论多"重要"，保持率
+        趋零后权重也趋零——遗忘可达是生命周期的前提。
+        校准锚点见 core/weight_system.py。
+        """
         cached = self.weight_cache.get(chunk.id)
         if cached and time.time() - cached.calculated_at < self.cache_ttl:
             return cached.factors
 
-        age = time.time() - chunk.created_at
+        from core.weight_system import ACTR_NOISE_SCALE, ACTR_THRESHOLD
 
-        # 时间衰减（指数衰减，关联减缓）
-        # 半衰期按记忆类型分层：故事/经历衰减最慢，交互细节最快
-        # （倍率表见 core/weight_system.py，继承自记忆科学的
-        #  程序性/陈述性记忆分层）
-        from core.weight_system import halflife_multiplier
-        type_half_life = self.decay_half_life * halflife_multiplier(chunk.memory_type)
-        # 关联强度按边权求和，而不是数条目：十条 0.05 的弱边
-        # 不应享受十条 1.0 强边的衰减减缓（检索共激活产生的大量
-        # 弱边曾借此让普通记忆几乎不衰减）
-        assoc_strength = sum(chunk.associations.values())
-        effective_decay = self.decay_rate * (1 - assoc_strength * self.assoc_stability)
-        effective_decay = max(effective_decay, 0.01)
-        time_decay = math.exp(-effective_decay * age / type_half_life)
-        time_decay = 0.1 + 0.9 * time_decay  # 归一化到0.1~1.0
+        now = time.time()
 
-        # 使用频率（对数增长）
+        # ACT-R 激活 -> 保持率
+        activation = self._base_level_activation(chunk, now)
+        retention = 1.0 / (1.0 + math.exp(
+            -(activation - ACTR_THRESHOLD) / ACTR_NOISE_SCALE
+        ))
+
+        # 解释性指标（供审计展示，不直接参与 final）
         if chunk.access_count == 0:
             frequency = 0.0
         else:
             frequency = math.log(1 + chunk.access_count) / math.log(1 + self.freq_half_life)
-
-        # 近因效应
-        time_since_access = time.time() - chunk.last_accessed
-        if time_since_access <= self.recency_window:
-            recency = 1.0 - (time_since_access / self.recency_window) * 0.5
-        else:
-            excess = time_since_access - self.recency_window
-            recency = 0.5 * math.exp(-excess / (7 * 24 * 3600))
+        time_since_access = now - chunk.last_accessed
+        recency = math.exp(-time_since_access / max(self.recency_window, 1.0))
 
         # 情绪增强
         emotion_boost = chunk.emotion_valence * chunk.emotion_intensity
 
         # 关联密度（按强度加权：弱边贡献按比例缩小）
+        assoc_strength = sum(chunk.associations.values())
         if assoc_strength <= 0:
             association_density = 0.0
         else:
@@ -188,23 +246,20 @@ class MemoryLayerCore:
         # 连接价值
         connection_boost = chunk.connection_value
 
-        # 综合权重
-        #
-        # 关键设计：情绪、重要性、连接价值、关联密度这些"结构性"因子必须
-        # 被 time_decay 门控。否则它们构成一个不随时间衰减的权重下限，
-        # 永远高于 degrade_threshold，导致记忆无法降级到伪遗忘层，
-        # "遗忘-唤醒"生命周期完全失效。
-        #
-        # 关联密度尤其危险：检索时的 Hebbian 共激活会让常被检索的记忆
-        # 快速积累关联，如果 association 项不被门控，它们会变得永远
-        # 无法遗忘（0.15 的永久下限）。关联对持久性的贡献已经由
-        # assoc_stability 承担（关联多的记忆衰减更慢），这里不再重复
-        # 提供永久权重。
+        # 保持率权重 = 原三个使用类因子的系数之和（保留自定义
+        # coeffs 的兼容性：调过 time_decay/frequency/recency 的
+        # 部署，其总投入比例不变）
+        retention_weight = (
+            self.coeffs['time_decay']
+            + self.coeffs['frequency']
+            + self.coeffs['recency']
+        )
+
+        # 静态因子必须被保持率门控：否则它们构成不随时间衰减的
+        # 权重下限，记忆永远无法降级，遗忘-唤醒生命周期失效
         final = (
-            self.coeffs['time_decay'] * time_decay +
-            self.coeffs['frequency'] * frequency +
-            self.coeffs['recency'] * recency +
-            time_decay * (
+            retention_weight * retention
+            + retention * (
                 self.coeffs['emotion'] * (0.5 + 0.5 * emotion_boost) +
                 self.coeffs['importance'] * importance_base +
                 self.coeffs['connection'] * connection_boost +
@@ -216,7 +271,9 @@ class MemoryLayerCore:
         final = max(0.0, min(1.0, final))
 
         factors = WeightFactors(
-            time_decay=time_decay,
+            activation=activation,
+            retention=retention,
+            time_decay=retention,  # 历史字段名，保持兼容
             frequency=frequency,
             recency=recency,
             emotion_boost=emotion_boost,

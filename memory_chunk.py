@@ -96,6 +96,11 @@ class MemoryChunk:
     # 直接叠加进 calc_weight 的最终权重，让反馈真正影响记忆去留。
     recall_bias: float = 0.0
 
+    # 使用时间戳日志（ACT-R 基线激活的输入，Petrov O(k) 混合近似：
+    # 精确保留最近 ACCESS_LOG_SIZE 次，更早的次数由 access_count
+    # 统计近似）。编码事件（创建）算第一次使用。
+    access_log: list = field(default_factory=list)
+
     # 关联记忆（Hebbian关联）
     associations: Dict[str, float] = field(default_factory=dict)  # chunk_id -> weight
 
@@ -129,11 +134,23 @@ class MemoryChunk:
     # 元数据（扩展字段）
     metadata: Dict[str, Any] = field(default_factory=dict)
     
+    # Petrov 混合近似精确保留的时间戳条数
+    ACCESS_LOG_SIZE = 8
+
+    def __post_init__(self):
+        # 编码事件算第一次使用（旧数据没有 access_log 时同样成立）
+        if not self.access_log:
+            self.access_log = [self.created_at]
+
     def access(self):
         """记录一次访问"""
-        self.last_accessed = time.time()
-        self.updated_at = time.time()
+        now = time.time()
+        self.last_accessed = now
+        self.updated_at = now
         self.access_count += 1
+        self.access_log.append(now)
+        if len(self.access_log) > self.ACCESS_LOG_SIZE:
+            self.access_log = self.access_log[-self.ACCESS_LOG_SIZE:]
     
     def successful_recall(self):
         """记录一次成功唤醒"""
@@ -258,6 +275,7 @@ class MemoryChunk:
             "access_count": self.access_count,
             "successful_recall_count": self.successful_recall_count,
             "recall_bias": self.recall_bias,
+            "access_log": list(self.access_log),
             "associations": self.associations,
             "review_status": self.review_status,
             "review_note": self.review_note,
