@@ -162,3 +162,86 @@ def test_sources_survive_layer_flag(tmp_path):
     system.sleep()
     for cid in cluster_ids:
         assert system.forgotten.get(cid).layer == MemoryLayer.FORGOTTEN
+
+
+# ============ 图式强化：要点支持计数 ============
+
+def test_second_sleep_reinforces_existing_gist(tmp_path):
+    """同主题的后续情景增强既有要点，而不是重复抽象出新要点"""
+    system = _make_system(tmp_path)
+    first_ids = _add_cluster(system, n=3)
+    report1 = system.sleep()
+    assert len(report1.gists_created) == 1
+    gist_id = report1.gists_created[0]
+
+    # 一周后又有 3 次同主题经历
+    second_ids = _add_cluster(system, n=3)
+    report2 = system.sleep()
+
+    # 不新建，而是强化
+    assert report2.gists_created == []
+    assert report2.gists_reinforced == [gist_id]
+
+    gist = system.core.get(gist_id)
+    assert gist.metadata["support_count"] == 2
+    assert gist.metadata["supporting_episodes"] == 6
+    assert gist.importance == min(1.0, 0.6 + 0.05 * 6)
+    assert "（6次相关经历）" in gist.content
+    assert set(first_ids + second_ids) <= set(gist.metadata["source_ids"])
+
+    # 新来源同样归档且可溯源到该要点
+    for cid in second_ids:
+        assert system.core.get(cid) is None
+        archived = system.forgotten.get(cid)
+        assert archived is not None
+        assert archived.metadata["consolidated_into"] == gist_id
+        assert gist.associations.get(cid, 0.0) > 0
+
+
+def test_unrelated_cluster_still_creates_new_gist(tmp_path):
+    """主题不同的新簇不被既有要点吞并（阈值高于聚类阈值）"""
+    system = _make_system(tmp_path)
+    _add_cluster(system, n=3)  # 老王/工作/项目
+    report1 = system.sleep()
+    assert len(report1.gists_created) == 1
+
+    for i in range(3):
+        system.add_memory(
+            content=f"和小李第{i}次去崇礼滑雪，雪况很好",
+            persons=["小李"], topics=["滑雪", "旅行"], keywords=["滑雪"],
+            importance=0.6,
+        )
+    report2 = system.sleep()
+    assert len(report2.gists_created) == 1, "不同主题被错误归并进既有要点"
+    assert report2.gists_reinforced == []
+
+
+def test_reinforcement_refreshes_inverted_index_and_timestamps(tmp_path):
+    """强化并入的新锚点必须进核心层倒排索引（对抗审查实证缺陷）
+
+    裸 _store.put 不更新 topic_index/person_index，常驻 MCP 进程里
+    新锚点会检索不到直到重启；修复后走 core.add 的快照回滚重建。
+    """
+    system = _make_system(tmp_path)
+    _add_cluster(system, n=3)
+    report1 = system.sleep()
+    gist_id = report1.gists_created[0]
+    before_updated = system.core.get(gist_id).updated_at
+
+    # 同主题新簇，但带一个全新主题"预算"
+    for i in range(3):
+        system.add_memory(
+            content=f"和老王开会讨论了第{i}季度预算",
+            persons=["老王"], topics=["工作", "项目", "预算"],
+            keywords=["会议", "预算"], importance=0.6,
+        )
+    report2 = system.sleep()
+    assert report2.gists_reinforced == [gist_id]
+
+    gist = system.core.get(gist_id)
+    assert "预算" in gist.topics
+    # 新锚点立即可经倒排索引检索（不等进程重启）
+    assert gist_id in system.core.topic_index.get("预算", set()), (
+        "强化并入的新主题未进倒排索引"
+    )
+    assert gist.updated_at > before_updated, "强化未刷新 updated_at"

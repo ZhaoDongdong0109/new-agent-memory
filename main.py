@@ -1025,6 +1025,7 @@ class HumanLikeMemorySystem:
                     "replayed": report.replayed,
                     "clusters": report.clusters,
                     "gists": report.gists_created,
+                    "reinforced": report.gists_reinforced,
                     "archived": len(report.sources_archived),
                     "edges_pruned": report.edges_pruned,
                 },
