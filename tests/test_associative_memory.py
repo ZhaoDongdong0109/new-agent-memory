@@ -146,12 +146,14 @@ def test_association_wakes_and_promotes_forgotten_memory(tmp_path):
 # ============ 按类型分层的衰减 ============
 
 def test_halflife_multiplier_ordering():
-    """半衰期倍率保持记忆科学排序：故事 > 想法 > 偏好 > 事实 > 交互"""
+    """半衰期倍率保持记忆科学排序：流程 > 故事 > 想法 > 偏好 > 事实 > 交互"""
     m = halflife_multiplier
-    assert m(MemoryType.STORY) > m(MemoryType.IDEA) > m(MemoryType.PREFERENCE) \
-        > m(MemoryType.FACT) > m(MemoryType.INTERACTION) == 1.0
+    assert m(MemoryType.PROCEDURE) > m(MemoryType.STORY) > m(MemoryType.IDEA) \
+        > m(MemoryType.PREFERENCE) > m(MemoryType.FACT) \
+        > m(MemoryType.INTERACTION) == 1.0
     # 字符串形式与未知类型的容错
     assert m("story") == m(MemoryType.STORY)
+    assert m("procedure") == m(MemoryType.PROCEDURE)
     assert m("unknown-type") == 1.0
 
 
@@ -176,3 +178,57 @@ def test_story_decays_slower_than_interaction(tmp_path):
     assert w_story > w_chat, (
         f"30 天后 STORY({w_story:.3f}) 应比 INTERACTION({w_chat:.3f}) 持久"
     )
+
+
+# ============ 工作记忆容量截断 ============
+
+def test_retrieve_limit_confines_observation_side_effects(tmp_path):
+    """容量截断在访问反馈之前：落选记忆不计访问、不入共激活
+
+    狗粮期第二轮实测：不加上限时单次检索返回 15 条，客户端只看
+    前 5 条，但 15 条全部被 access() 计数并互相 Hebbian 连线——
+    观测副作用把融合噪声写进了频率效应与关联图。
+    """
+    system = _make_system(tmp_path)
+    ids = [
+        system.add_memory(content=f"检索管线调优笔记第{i}条", keywords=["检索"])
+        for i in range(8)
+    ]
+    result = system.retrieve("检索调优", limit=3)
+    assert result.success
+    assert len(result.chunks) == 3
+    assert "未纳入" in result.review_note
+
+    kept = {c.id for c in result.chunks}
+    for cid in ids:
+        chunk = system.core.get(cid)
+        if cid in kept:
+            assert chunk.access_count >= 1
+        else:
+            assert chunk.access_count == 0, "落选记忆不应计入访问"
+            assert not chunk.associations, "落选记忆不应被共激活连线"
+
+
+def test_retrieve_limit_reserves_association_slots(tmp_path):
+    """容量截断为联想通路保留席位：主线几条 + 联想一两条"""
+    system = _make_system(tmp_path, enable_hybrid_retrieval=False)
+    direct = [
+        system.add_memory(content=f"滑雪计划第{i}步", topics=["旅行"])
+        for i in range(5)
+    ]
+    id_b = system.add_memory(content="崇礼的雪季是十一月到三月", topics=["天气"])
+    system.core.strengthen_association(direct[0], id_b, strength=0.9)
+
+    result = system.retrieve("滑雪旅行的计划", limit=3)
+    assert result.success
+    assert len(result.chunks) == 3
+    assert id_b in {c.id for c in result.chunks}, "容量截断挤掉了联想回忆"
+
+
+def test_retrieve_without_limit_unchanged(tmp_path):
+    """不传 limit 时保持完整召回（库内评测与向后兼容）"""
+    system = _make_system(tmp_path)
+    for i in range(8):
+        system.add_memory(content=f"检索管线调优笔记第{i}条", keywords=["检索"])
+    result = system.retrieve("检索调优")
+    assert len(result.chunks) >= 8

@@ -141,3 +141,62 @@ def test_add_with_fact_type_gets_supersession(server):
     text = _text(_call(server, "memory_search", {"query": "现在的端口是多少"}))
     assert "9000" in text
     assert "8420" not in text, "被取代的旧端口冒充了现状"
+
+
+def test_jsonrpc_dispatch_covers_all_tools(server):
+    """JSON-RPC 白名单必须与工具注册表同源
+
+    狗粮期第二轮实测：白名单曾硬编码 3 个工具名，7 个认知工具在
+    真实客户端路径（handle_request）上全部 Unknown tool——而狗粮
+    脚本直接调 _call_tool 绕过了白名单，第一轮没咬出来。
+    """
+    listed = {t["name"] for t in server._list_tools()["tools"]}
+    for name in sorted(listed):
+        resp = server.handle_request({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": {}},
+        })
+        assert "error" not in resp, f"{name} 被 JSON-RPC 白名单拦截"
+    # 未知工具仍按协议报 Invalid params
+    resp = server.handle_request({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "memory_nope", "arguments": {}},
+    })
+    assert resp["error"]["code"] == -32602
+
+
+def test_search_limit_caps_and_discloses(server):
+    """搜索默认最多 5 条，落选数量诚实披露，limit 可调"""
+    for i in range(12):
+        server.memory.add_memory(
+            content=f"检索管线调优笔记第{i}条：融合与归一化",
+            keywords=["检索"], topics=["调优"],
+        )
+    text = _text(_call(server, "memory_search", {"query": "检索调优"}))
+    lines = [ln for ln in text.splitlines() if ln.startswith("[mem_")]
+    assert len(lines) <= 5, f"默认应最多返回 5 条，实际 {len(lines)}"
+    assert "未纳入" in text, "落选数量应披露给客户端"
+
+    text3 = _text(_call(server, "memory_search", {"query": "检索调优", "limit": 3}))
+    lines3 = [ln for ln in text3.splitlines() if ln.startswith("[mem_")]
+    assert len(lines3) <= 3
+
+
+def test_add_with_procedure_type(server):
+    """程序性知识：最慢衰减 + 参与取代管理（流程改版）"""
+    text = _text(_call(server, "memory_add", {
+        "content": "发布流程：先跑全部测试，再手动触发 publish 工作流",
+        "memory_type": "procedure", "topics": ["发布"],
+    }))
+    assert "type=procedure" in text
+
+    _call(server, "memory_add", {
+        "content": "发布流程：先跑全部测试，再用 workflow_dispatch 手动触发 publish 工作流，检查 Trusted Publisher 匹配",
+        "memory_type": "procedure", "topics": ["发布"],
+    })
+    text = _text(_call(server, "memory_search", {"query": "发布流程怎么走"}))
+    assert "workflow_dispatch" in text
+    # 旧版流程不得与新版并列冒充现行流程
+    lines = [ln for ln in text.splitlines() if ln.startswith("[mem_")]
+    old_current = [ln for ln in lines if "workflow_dispatch" not in ln and "发布流程" in ln]
+    assert not old_current, f"旧版流程冒充现行：{old_current}"

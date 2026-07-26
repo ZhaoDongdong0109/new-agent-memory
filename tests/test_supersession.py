@@ -269,3 +269,24 @@ def test_true_duplicate_with_same_numbers_still_noop(tmp_path):
     id_b = _add_fact(system, "当前发布的版本是 0.2.0", topics=["版本"])
     assert id_b == id_a
     assert len(system.core) == 1
+
+
+def test_procedure_update_supersedes_old_workflow(tmp_path):
+    """流程改版：新流程取代旧流程，历史保留在取代链上"""
+    system = _make_system(tmp_path)
+    id_v1 = _add_fact(system, "发布流程是先跑测试再手动触发 publish 工作流",
+                      topics=["发布"], keywords=["发布", "流程"],
+                      memory_type=MemoryType.PROCEDURE)
+    id_v2 = _add_fact(system, "发布流程是先跑测试，再用 workflow_dispatch 触发 publish 工作流并检查 Trusted Publisher",
+                      topics=["发布"], keywords=["发布", "流程"],
+                      memory_type=MemoryType.PROCEDURE)
+
+    assert id_v2 != id_v1
+    old = system.forgotten.get(id_v1)
+    # 旧流程要么被取代归档，要么被就地更新（UPDATE 保留 history）
+    if old is not None:
+        assert old.invalid_at is not None
+        assert old.metadata["superseded_by"] == id_v2
+    else:
+        updated = system.core.get(id_v1)
+        assert updated is not None and updated.version >= 2

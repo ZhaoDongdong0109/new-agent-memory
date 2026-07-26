@@ -14,9 +14,12 @@ mcp_server.create_llm_fn = lambda: None
 server = mcp_server.MemoryMCPServer()
 
 
-def search(query):
-    result = server._call_tool({"name": "memory_search", "arguments": {"query": query}})
-    return result["content"][0]["text"]
+def search(query, **extra):
+    resp = server.handle_request({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "memory_search", "arguments": {"query": query, **extra}},
+    })
+    return resp["result"]["content"][0]["text"]
 
 
 # (查询, 期望出现在结果里的关键子串)
@@ -49,7 +52,10 @@ for query, expect in QUERIES:
     lines = [ln for ln in text.splitlines() if ln.startswith("[mem_")]
     if expect is None:
         total_neg += 1
-        ok = "No relevant memories" in text or not lines
+        # 正确处置 = 拒答，或返回但带覆盖率软标注（强警告/谨慎均可：
+        # 无嵌入的词面覆盖不能硬弃答——第一轮教训，判断权交给调用方）
+        ok = ("No relevant memories" in text or not lines
+              or "警告" in text or "谨慎" in text)
         abstain_ok += ok
         print(f"{'✓' if ok else '✗ 应弃答却回答了'} [负例] {query}")
         if not ok:

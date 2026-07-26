@@ -162,6 +162,22 @@ class MemoryMCPServer:
 
         self.memory.load()
 
+        # 工具名 -> 处理器。唯一事实来源：handle_request 的白名单与
+        # _call_tool 的分发都从这里读。狗粮期第二轮实测：白名单曾
+        # 硬编码 3 个工具名，7 个认知工具在真实 JSON-RPC 路径上全部
+        # "Unknown tool"——而狗粮脚本直接调 _call_tool 绕过了它。
+        self._tool_handlers = {
+            "memory_search": self._search,
+            "memory_add": self._add,
+            "memory_stats": lambda args: self._stats(),
+            "memory_explain": self._explain,
+            "memory_history": self._history,
+            "memory_sleep": lambda args: self._sleep(),
+            "memory_focus": self._focus,
+            "memory_feedback": self._feedback,
+            "memory_maintain": lambda args: self._maintain(),
+        }
+
     def handle_request(self, request: dict) -> dict:
         """处理 MCP 请求，返回完整的 JSON-RPC 响应对象"""
         method = request.get("method")
@@ -176,7 +192,7 @@ class MemoryMCPServer:
             result = self._list_tools()
         elif method == "tools/call":
             tool_name = params.get("name")
-            if tool_name not in ("memory_search", "memory_add", "memory_stats"):
+            if tool_name not in self._tool_handlers:
                 # 未知工具：按 JSON-RPC 规范返回顶层 error（Invalid params）
                 return self._error_response(
                     request_id, -32602, f"Unknown tool: {tool_name}"
@@ -229,6 +245,11 @@ class MemoryMCPServer:
                             "query": {
                                 "type": "string",
                                 "description": "What to search for in memories"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Max memories to return (1-20, default 5). Weaker tail matches beyond the limit are omitted and counted in the note.",
+                                "default": 5
                             }
                         },
                         "required": ["query"]
@@ -262,12 +283,13 @@ class MemoryMCPServer:
                             },
                             "memory_type": {
                                 "type": "string",
-                                "enum": ["interaction", "fact", "preference", "story", "idea"],
+                                "enum": ["interaction", "fact", "preference", "story", "idea", "procedure"],
                                 "description": (
-                                    "Memory type. 'fact'/'preference' get "
+                                    "Memory type. 'fact'/'preference'/'procedure' get "
                                     "bi-temporal supersession (new values replace "
                                     "old, history preserved) and slower decay; "
-                                    "'story' decays slowest; default 'interaction' "
+                                    "'procedure' (how-to/workflow knowledge) decays "
+                                    "slowest, then 'story'; default 'interaction' "
                                     "decays fastest. Use 'fact' for durable facts."
                                 ),
                                 "default": "interaction"
@@ -404,31 +426,15 @@ class MemoryMCPServer:
         arguments = params.get("arguments", {})
 
         try:
-            if tool_name == "memory_search":
-                return self._search(arguments)
-            elif tool_name == "memory_add":
-                return self._add(arguments)
-            elif tool_name == "memory_stats":
-                return self._stats()
-            elif tool_name == "memory_explain":
-                return self._explain(arguments)
-            elif tool_name == "memory_history":
-                return self._history(arguments)
-            elif tool_name == "memory_sleep":
-                return self._sleep()
-            elif tool_name == "memory_focus":
-                return self._focus(arguments)
-            elif tool_name == "memory_feedback":
-                return self._feedback(arguments)
-            elif tool_name == "memory_maintain":
-                return self._maintain()
-            else:
+            handler = self._tool_handlers.get(tool_name)
+            if handler is None:
                 return {
                     "content": [
                         {"type": "text", "text": f"Unknown tool: {tool_name}"}
                     ],
                     "isError": True,
                 }
+            return handler(arguments)
         except Exception as e:
             return {
                 "content": [
@@ -440,7 +446,12 @@ class MemoryMCPServer:
     def _search(self, args: dict) -> dict:
         """检索记忆（返回 id 供 memory_explain / memory_history 溯源）"""
         query = args.get("query", "")
-        result = self.memory.retrieve(query, allow_forgotten=True)
+        try:
+            limit = int(args.get("limit", 5))
+        except (TypeError, ValueError):
+            limit = 5
+        limit = max(1, min(20, limit))
+        result = self.memory.retrieve(query, allow_forgotten=True, limit=limit)
 
         if result.success:
             lines = [
@@ -450,7 +461,7 @@ class MemoryMCPServer:
             if result.review_note:
                 lines.append(f"note: {result.review_note}")
             lines.append("")
-            for chunk in result.chunks[:5]:
+            for chunk in result.chunks:
                 topics = ",".join(list(chunk.topics)[:4])
                 lines.append(
                     f"[{chunk.id}] (imp={chunk.importance:.1f}"
