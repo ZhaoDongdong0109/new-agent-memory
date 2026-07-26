@@ -150,8 +150,11 @@ class MemoryLayerCore:
         #  程序性/陈述性记忆分层）
         from core.weight_system import halflife_multiplier
         type_half_life = self.decay_half_life * halflife_multiplier(chunk.memory_type)
-        assoc_count = len(chunk.associations)
-        effective_decay = self.decay_rate * (1 - assoc_count * self.assoc_stability)
+        # 关联强度按边权求和，而不是数条目：十条 0.05 的弱边
+        # 不应享受十条 1.0 强边的衰减减缓（检索共激活产生的大量
+        # 弱边曾借此让普通记忆几乎不衰减）
+        assoc_strength = sum(chunk.associations.values())
+        effective_decay = self.decay_rate * (1 - assoc_strength * self.assoc_stability)
         effective_decay = max(effective_decay, 0.01)
         time_decay = math.exp(-effective_decay * age / type_half_life)
         time_decay = 0.1 + 0.9 * time_decay  # 归一化到0.1~1.0
@@ -173,11 +176,11 @@ class MemoryLayerCore:
         # 情绪增强
         emotion_boost = chunk.emotion_valence * chunk.emotion_intensity
 
-        # 关联密度
-        if assoc_count == 0:
+        # 关联密度（按强度加权：弱边贡献按比例缩小）
+        if assoc_strength <= 0:
             association_density = 0.0
         else:
-            association_density = min(math.log(1 + assoc_count) / math.log(11), 1.0)
+            association_density = min(math.log(1 + assoc_strength) / math.log(11), 1.0)
 
         # 重要性基础
         importance_base = chunk.importance
@@ -476,10 +479,15 @@ class MemoryLayerCore:
         if not chunk_a or not chunk_b:
             return
 
-        if chunk_id_b in chunk_a.associations:
-            chunk_a.associations[chunk_id_b] = max(0.0, chunk_a.associations[chunk_id_b] - strength)
-        if chunk_id_a in chunk_b.associations:
-            chunk_b.associations[chunk_id_a] = max(0.0, chunk_b.associations[chunk_id_a] - strength)
+        # 衰减到接近零的边直接删除：零强度条目没有任何信息价值，
+        # 却会永久占据关联表（Hebbian 突触修剪）
+        for owner, other in ((chunk_a, chunk_id_b), (chunk_b, chunk_id_a)):
+            if other in owner.associations:
+                new_strength = max(0.0, owner.associations[other] - strength)
+                if new_strength <= 0.01:
+                    del owner.associations[other]
+                else:
+                    owner.associations[other] = new_strength
         self._store.put(chunk_a)
         self._store.put(chunk_b)
         self._invalidate_weight(chunk_id_a)
