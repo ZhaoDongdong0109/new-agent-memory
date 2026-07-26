@@ -9,7 +9,6 @@ Benchmark 运行脚本
 """
 
 import argparse
-import json
 import os
 import sys
 
@@ -88,9 +87,24 @@ def main():
     print(f"  测试 {weight_result.get('tested', 0)} 个记忆")
     print(f"  平均延迟: {weight_result.get('latency_mean', 0)*1000:.2f}ms")
 
+    # 运行确定性探针（种子可复现，无 LLM 评审）
+    print("\n运行确定性探针（ToT-lite / 知识更新 / 容量门）...")
+    import tempfile
+    from scripts.bench.tot_lite import probes_report_section, run_all_probes
+    with tempfile.TemporaryDirectory() as probe_dir:
+        probe_results = run_all_probes(probe_dir, seed=42)
+    for probe in probe_results:
+        print(f"  {probe['name']}: " + ", ".join(
+            f"{k}={v:.3f}" for k, v in probe.items()
+            if isinstance(v, float) and not k.endswith("_ms")
+        ))
+
     # 生成报告
     print(f"\n生成报告: {args.output}")
     report = runner.generate_report(args.output)
+    report += probes_report_section(probe_results)
+    with open(args.output, "w", encoding="utf-8") as f:
+        f.write(report)
     print(report)
 
     print("\n" + "=" * 60)

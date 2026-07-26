@@ -14,7 +14,6 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from main import HumanLikeMemorySystem
-from scripts.bench.benchmark_runner import BenchmarkRunner
 from scripts.bench.metrics import (
     recall_at_k,
     precision_at_k,
@@ -328,11 +327,11 @@ def main():
         print("\n" + "=" * 60)
         print("Benchmark Summary")
         print("=" * 60)
-        print(f"\nRetrieval Quality:")
+        print("\nRetrieval Quality:")
         print(f"  Recall@1: {retrieval_result['metrics']['mean_recall@1']:.4f}")
         print(f"  Recall@3: {retrieval_result['metrics']['mean_recall@3']:.4f}")
         print(f"  MRR: {retrieval_result['metrics']['mean_mrr']:.4f}")
-        print(f"\nLatency:")
+        print("\nLatency:")
         print(f"  Retrieval P50: {retrieval_result['metrics']['latency_p50']*1000:.2f}ms")
         print(f"  Retrieval P95: {retrieval_result['metrics']['latency_p95']*1000:.2f}ms")
         print(f"  Write P50: {write_result['latency_p50']*1000:.2f}ms")

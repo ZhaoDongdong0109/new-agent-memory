@@ -7,7 +7,7 @@ Benchmark 运行器
 import json
 import os
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Dict, List
 
 from scripts.bench.metrics import (
     calculate_all_metrics,
@@ -107,7 +107,6 @@ class BenchmarkRunner:
         for item in dataset:
             episodes = item["episodes"]
             expected_count = item.get("expected_memory_count", 0)
-            expected_types = item.get("expected_types", [])
 
             # 运行巩固
             start = time.time()
