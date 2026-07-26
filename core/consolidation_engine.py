@@ -136,25 +136,26 @@ class ConsolidationEngine:
 
     def _calculate_similarity(self, text1: str, text2: str) -> float:
         """
-        计算文本相似度
+        计算文本相似度（token 级 Jaccard）。
 
-        简单实现：基于字符重叠。
+        不用字符集合：中文常用字只有两三千个，字符集 Jaccard 在
+        CJK 文本上会迅速饱和——两段完全无关的中文很容易共享大量
+        单字，导致"陌生人被判为重复、真重复反而不突出"。
+        token 化（词 + 中文 bigram）后集合空间足够大，相似度才有区分度。
         """
         if not text1 or not text2:
             return 0.0
 
-        # 转换为字符集合
-        chars1 = set(text1)
-        chars2 = set(text2)
+        from core.supersession import _tokenize
 
-        # 计算 Jaccard 相似度
-        intersection = chars1 & chars2
-        union = chars1 | chars2
+        tokens1 = _tokenize(text1)
+        tokens2 = _tokenize(text2)
 
+        union = tokens1 | tokens2
         if not union:
             return 0.0
 
-        return len(intersection) / len(union)
+        return len(tokens1 & tokens2) / len(union)
 
     def _merge_memory(self, existing: Any, new_spec: MemorySpec):
         """
