@@ -61,8 +61,13 @@ class DataManager:
                 if self._belongs_to_user(chunk, user_id):
                     chunks_to_delete.append(chunk_id)
 
+            planner = getattr(self.memory, "query_planner", None)
             for chunk_id in chunks_to_delete:
                 self.memory.core.remove(chunk_id)
+                # 同步清理混合检索索引：残留 id 会占用其他用户
+                # 检索结果的融合名额
+                if planner:
+                    planner.remove_chunk(chunk_id)
                 deleted["core_memories"] += 1
 
         # 删除伪遗忘层记忆

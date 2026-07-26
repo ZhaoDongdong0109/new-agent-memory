@@ -187,11 +187,16 @@ class MemoryLayerCore:
 
         # 综合权重
         #
-        # 关键设计：情绪、重要性、连接价值这三个"静态"因子必须被 time_decay 门控。
-        # 否则它们构成一个不随时间衰减的权重下限（约 0.195），永远高于
-        # degrade_threshold（默认 0.15），导致任何默认记忆都无法降级到伪遗忘层，
-        # "遗忘-唤醒"生命周期完全失效。门控后，长期不用的记忆权重会真正
-        # 逼近 ~0.04，降级变得可达；而高重要性/强情绪记忆依然衰减得更慢。
+        # 关键设计：情绪、重要性、连接价值、关联密度这些"结构性"因子必须
+        # 被 time_decay 门控。否则它们构成一个不随时间衰减的权重下限，
+        # 永远高于 degrade_threshold，导致记忆无法降级到伪遗忘层，
+        # "遗忘-唤醒"生命周期完全失效。
+        #
+        # 关联密度尤其危险：检索时的 Hebbian 共激活会让常被检索的记忆
+        # 快速积累关联，如果 association 项不被门控，它们会变得永远
+        # 无法遗忘（0.15 的永久下限）。关联对持久性的贡献已经由
+        # assoc_stability 承担（关联多的记忆衰减更慢），这里不再重复
+        # 提供永久权重。
         final = (
             self.coeffs['time_decay'] * time_decay +
             self.coeffs['frequency'] * frequency +
@@ -199,9 +204,9 @@ class MemoryLayerCore:
             time_decay * (
                 self.coeffs['emotion'] * (0.5 + 0.5 * emotion_boost) +
                 self.coeffs['importance'] * importance_base +
-                self.coeffs['connection'] * connection_boost
-            ) +
-            self.coeffs['association'] * association_density
+                self.coeffs['connection'] * connection_boost +
+                self.coeffs['association'] * association_density
+            )
         )
         # 回忆反馈偏置：被确认正确的记忆权重上浮，被纠错的下沉
         final += chunk.recall_bias
@@ -291,11 +296,19 @@ class MemoryLayerCore:
         for chunk in self._store.get_all().values():
             self._add_to_index(chunk)
 
-    def _select_candidates(self, query_tags: Dict[str, Any]) -> List[str]:
+    def _select_candidates(
+        self,
+        query_tags: Dict[str, Any],
+        allow_scan_fallback: bool = True,
+    ) -> List[str]:
         """
         基于索引选择候选集。
 
         多个索引命中时取交集；没有索引可用时退回受限扫描，避免全量遍历。
+
+        allow_scan_fallback=False 时，索引零命中直接返回空列表——
+        供混合检索的元数据腿使用：锚点存在但没有命中时，不能把
+        "整个存储的前 200 条"当作命中结果灌进 RRF 融合。
         """
         buckets: List[Set[str]] = []
 
@@ -330,6 +343,9 @@ class MemoryLayerCore:
             if not candidates:
                 candidates = set.union(*non_empty)
             return list(candidates)[:self.max_scan_candidates]
+
+        if not allow_scan_fallback:
+            return []
 
         return self.all_ids[:self.max_scan_candidates]
 

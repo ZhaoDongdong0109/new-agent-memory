@@ -137,13 +137,21 @@ class MemoryMCPServer:
         # 尝试创建 LLM 函数
         llm_fn = create_llm_fn()
 
-        # 数据目录：优先 MEMORY_DATA_DIR 环境变量，
-        # 否则锚定到本文件所在目录，避免随客户端 cwd 变化导致记忆分散
+        # 数据目录优先级：
+        # 1. MEMORY_DATA_DIR 环境变量（显式指定）
+        # 2. 当前工作目录已存在的 ./memory_data（历史部署的存量记忆，
+        #    直接切走会造成"静默失忆"）
+        # 3. 本文件所在目录（新部署的默认值，避免随客户端 cwd 分散）
         data_dir = os.getenv("MEMORY_DATA_DIR")
         if not data_dir:
-            data_dir = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "memory_data"
-            )
+            legacy_dir = os.path.join(os.getcwd(), "memory_data")
+            if os.path.isdir(legacy_dir) and os.listdir(legacy_dir):
+                data_dir = legacy_dir
+                print(f"[MCP] 使用现有记忆目录: {legacy_dir}", file=sys.stderr)
+            else:
+                data_dir = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "memory_data"
+                )
 
         self.memory = HumanLikeMemorySystem(
             data_dir=data_dir,

@@ -169,7 +169,8 @@ class MemoryRetrieval:
 
     def promote_woken(self, forgotten_results: List[tuple]) -> List[MemoryChunk]:
         """
-        把唤醒结果中锚点足够强的记忆提升回核心层。
+        把唤醒结果中锚点足够强的记忆提升回核心层，
+        返回完整的唤醒列表（被提升的条目已替换为核心层的新对象）。
 
         这是"遗忘-唤醒"生命周期的关键闭环：
         降级(maintain) -> 归档(forgotten) -> 线索唤醒(try_wake)
@@ -177,20 +178,24 @@ class MemoryRetrieval:
 
         弱唤醒（低于 promote_threshold）保持归档状态，但 try_wake
         已经为它们记录了唤醒痕迹。
+
+        注意必须使用返回值而不是原 forgotten_results 里的对象：
+        SQLite 后端返回副本，提升后原对象的 layer 标记已经过期。
         """
         ids = [
             chunk.id for chunk, temp_weight in forgotten_results
             if temp_weight >= self.promote_threshold
         ]
-        promoted = self.forgotten.promote(ids)
-        for chunk in promoted:
+        promoted = {c.id: c for c in self.forgotten.promote(ids)}
+        for chunk in promoted.values():
             self.core.add(chunk)
             # 提升即访问：给再巩固的记忆一个新鲜的近因信号
             self.core.access(chunk.id)
             if self.planner:
                 self.planner.add_chunk(chunk)
         self.total_promoted += len(promoted)
-        return promoted
+        # 被提升的条目替换为核心层新对象，未提升的保留原对象
+        return [promoted.get(chunk.id, chunk) for chunk, _tw in forgotten_results]
     
     # ============ 查询解析 ============
     
@@ -342,28 +347,10 @@ class MemoryRetrieval:
                 query_tags=ctx.to_tags(),
                 limit=self.core_limit,
             )
-
             if hybrid_results:
                 retrieval_path = "hybrid"
                 self.core_hit += 1
                 all_chunks = [chunk for chunk, _ in hybrid_results]
-            elif allow_forgotten:
-                # 混合检索没命中，尝试伪遗忘层唤醒
-                retrieval_path = "forgotten"
-                forgotten_results = self.forgotten.try_wake(
-                    ctx.to_tags(),
-                    limit=5,
-                )
-
-                if forgotten_results:
-                    self.forgotten_hit += 1
-                    all_chunks = [chunk for chunk, _ in forgotten_results]
-                    # 锚点足够强的唤醒记忆提升回核心层（遗忘-唤醒闭环）
-                    self.promote_woken(forgotten_results)
-                else:
-                    retrieval_path = "none"
-            else:
-                retrieval_path = "none"
         else:
             # 传统检索（向后兼容）
             core_results = self.core.retrieve(
@@ -371,29 +358,38 @@ class MemoryRetrieval:
                 min_weight=self.core_min_weight,
                 limit=self.core_limit,
             )
-
             if core_results:
                 retrieval_path = "core"
                 self.core_hit += 1
                 all_chunks = [chunk for chunk, _ in core_results]
 
-            elif allow_forgotten:
-                # 核心层没命中，尝试伪遗忘层唤醒
-                retrieval_path = "forgotten"
-                forgotten_results = self.forgotten.try_wake(
-                    ctx.to_tags(),
-                    limit=5,
-                )
-
-                if forgotten_results:
-                    self.forgotten_hit += 1
-                    all_chunks = [chunk for chunk, _ in forgotten_results]
-                    # 锚点足够强的唤醒记忆提升回核心层（遗忘-唤醒闭环）
-                    self.promote_woken(forgotten_results)
+        # Step 3: 伪遗忘层唤醒
+        #
+        # 关键：唤醒不是"核心未命中时的备胎"，而是与核心检索并行的通路。
+        # 混合检索几乎总能返回点什么（词法部分匹配），如果唤醒只在
+        # 核心全空时运行，遗忘-唤醒生命周期在实际部署中就永远不可达。
+        # 人类回忆也是如此：强线索既召回新记忆，也能翻出尘封的旧记忆。
+        if allow_forgotten:
+            forgotten_results = self.forgotten.try_wake(ctx.to_tags(), limit=5)
+            if forgotten_results:
+                self.forgotten_hit += 1
+                # 锚点足够强的唤醒记忆提升回核心层（遗忘-唤醒闭环）；
+                # 返回值里被提升的对象已替换为核心层版本（layer 已更新）
+                woken_chunks = self.promote_woken(forgotten_results)
+                if all_chunks:
+                    retrieval_path = "both"
+                    self.both_hit += 1
+                    seen = {c.id for c in all_chunks}
+                    for c in woken_chunks:
+                        if c.id not in seen:
+                            all_chunks.append(c)
+                            seen.add(c.id)
                 else:
-                    retrieval_path = "none"
-            else:
-                retrieval_path = "none"
+                    retrieval_path = "forgotten"
+                    all_chunks = woken_chunks
+
+        if not all_chunks:
+            retrieval_path = "none"
         
         # 如果都没有命中
         if not all_chunks:
@@ -410,7 +406,7 @@ class MemoryRetrieval:
         # Step 3.5: 联想回忆（扩散激活）
         # 由命中记忆沿 Hebbian 关联图扩散激活，把"因为想起 A 而想起 B"
         # 变成真实行为；被强激活的归档记忆会被联想唤醒甚至提升。
-        associated = self._associative_recall(all_chunks)
+        associated = self._associative_recall(all_chunks, allow_forgotten=allow_forgotten)
         seen_ids = {c.id for c in all_chunks}
         for c in associated:
             if c.id not in seen_ids:
@@ -451,6 +447,7 @@ class MemoryRetrieval:
         edge_fanout: int = 5,
         activation_threshold: float = 0.15,
         limit: int = 5,
+        allow_forgotten: bool = True,
     ) -> List[MemoryChunk]:
         """
         扩散激活联想回忆（spreading activation）。
@@ -473,14 +470,21 @@ class MemoryRetrieval:
 
         activation: Dict[str, float] = {c.id: 1.0 for c in seed_chunks}
         seed_ids = set(activation.keys())
-        # 非种子节点：id -> (chunk, 激活值)
+        # 非种子节点：id -> chunk
         collected: Dict[str, MemoryChunk] = {}
 
-        frontier: List[Tuple[MemoryChunk, float]] = [(c, 1.0) for c in seed_chunks]
+        # frontier 以 id 去重：同一节点在一跳内被多条路径激活时，
+        # 贡献已在 activation 中累积，但它本身只应向外传播一次——
+        # 重复的 frontier 条目会造成重复传播，人为放大下游激活，
+        # 进而错误触发归档记忆的提升。
+        frontier: Dict[str, MemoryChunk] = {c.id: c for c in seed_chunks}
         for _hop in range(max_hops):
-            next_frontier: List[Tuple[MemoryChunk, float]] = []
+            next_frontier: Dict[str, MemoryChunk] = {}
             # 排序保证传播顺序确定，结果可复现
-            for src_chunk, src_act in sorted(frontier, key=lambda x: (-x[1], x[0].id)):
+            for src_id, src_chunk in sorted(
+                frontier.items(), key=lambda x: (-activation[x[0]], x[0])
+            ):
+                src_act = activation[src_id]
                 if not src_chunk.associations:
                     continue
                 edges = sorted(
@@ -491,7 +495,10 @@ class MemoryRetrieval:
                     contribution = src_act * edge_weight * hop_decay
                     if contribution < 0.02:
                         continue
-                    target = self.core.get(assoc_id) or self.forgotten.get(assoc_id)
+                    target = self.core.get(assoc_id)
+                    if target is None and allow_forgotten:
+                        # 只有允许触碰伪遗忘层时才把归档记忆纳入联想
+                        target = self.forgotten.get(assoc_id)
                     if target is None:
                         continue
                     new_act = min(1.0, activation.get(assoc_id, 0.0) + contribution)
@@ -500,7 +507,7 @@ class MemoryRetrieval:
                     activation[assoc_id] = new_act
                     if assoc_id not in seed_ids:
                         collected[assoc_id] = target
-                    next_frontier.append((target, new_act))
+                    next_frontier[assoc_id] = target
             frontier = next_frontier
             if not frontier:
                 break
@@ -696,11 +703,14 @@ class MemoryRetrieval:
         accepted=False: 输出被纠正了，corrected_content是正确的内容
         """
         result = self.retrieve(query, allow_forgotten=False)
-        
+
         if not result.success:
             return
-        
-        for chunk in result.chunks:
+
+        # 反馈只作用于头部结果：用户对答案的评价主要由排名靠前的
+        # 记忆驱动，把惩罚摊到整个结果列表会永久压低碰巧被带出的
+        # 无关记忆（recall_bias 是持久的）。
+        for chunk in result.chunks[:3]:
             if chunk.layer == MemoryLayer.CORE:
                 self.core.adjust_after_recall(
                     chunk.id,
