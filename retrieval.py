@@ -139,6 +139,10 @@ class MemoryRetrieval:
 
         # 唤醒提升参数：唤醒临时权重达到该值的记忆会被提升回核心层
         promote_threshold: float = 0.55,
+
+        # 联想唤醒提升参数：扩散激活达到该值的归档记忆会被提升
+        # （1 跳、边权 0.5 时激活为 0.25——只有牢固关联才够格）
+        assoc_promote_threshold: float = 0.25,
     ):
         self.core = core_layer
         self.forgotten = forgotten_layer
@@ -149,6 +153,7 @@ class MemoryRetrieval:
         self.assembly_method = assembly_method
         self.review_confidence_threshold = review_confidence_threshold
         self.promote_threshold = promote_threshold
+        self.assoc_promote_threshold = assoc_promote_threshold
 
         # 统计
         self.total_retrievals = 0
@@ -156,6 +161,11 @@ class MemoryRetrieval:
         self.forgotten_hit = 0
         self.both_hit = 0
         self.total_promoted = 0
+        self.total_assoc_recalled = 0
+        self.total_assoc_wakes = 0
+
+        # 最近一次扩散激活的轨迹（联想回忆的可解释审计）
+        self.last_activation_trace: List[Tuple[str, float]] = []
 
     def promote_woken(self, forgotten_results: List[tuple]) -> List[MemoryChunk]:
         """
@@ -337,14 +347,6 @@ class MemoryRetrieval:
                 retrieval_path = "hybrid"
                 self.core_hit += 1
                 all_chunks = [chunk for chunk, _ in hybrid_results]
-
-                # Hebbian 关联扩展
-                expanded = self._expand_via_associations(all_chunks)
-                seen_ids = {c.id for c in all_chunks}
-                for c in expanded:
-                    if c.id not in seen_ids:
-                        all_chunks.append(c)
-                        seen_ids.add(c.id)
             elif allow_forgotten:
                 # 混合检索没命中，尝试伪遗忘层唤醒
                 retrieval_path = "forgotten"
@@ -375,14 +377,6 @@ class MemoryRetrieval:
                 self.core_hit += 1
                 all_chunks = [chunk for chunk, _ in core_results]
 
-                # Hebbian 关联扩展
-                expanded = self._expand_via_associations(all_chunks)
-                seen_ids = {c.id for c in all_chunks}
-                for c in expanded:
-                    if c.id not in seen_ids:
-                        all_chunks.append(c)
-                        seen_ids.add(c.id)
-
             elif allow_forgotten:
                 # 核心层没命中，尝试伪遗忘层唤醒
                 retrieval_path = "forgotten"
@@ -412,13 +406,23 @@ class MemoryRetrieval:
                 confidence=0.0,
                 review_note="没有找到相关记忆",
             )
-        
+
+        # Step 3.5: 联想回忆（扩散激活）
+        # 由命中记忆沿 Hebbian 关联图扩散激活，把"因为想起 A 而想起 B"
+        # 变成真实行为；被强激活的归档记忆会被联想唤醒甚至提升。
+        associated = self._associative_recall(all_chunks)
+        seen_ids = {c.id for c in all_chunks}
+        for c in associated:
+            if c.id not in seen_ids:
+                all_chunks.append(c)
+                seen_ids.add(c.id)
+
         # Step 4: 组装
         assembled = self._assemble(all_chunks, ctx)
-        
+
         # Step 5: 审阅
         review_result, confidence = self._review(all_chunks, assembled, ctx)
-        
+
         result = ReconstructionResult(
             success=True,
             chunks=all_chunks,
@@ -427,7 +431,11 @@ class MemoryRetrieval:
             retrieval_path=retrieval_path,
             confidence=confidence,
         )
-        
+
+        # Hebbian 共激活：一起被检索到的记忆互相连线
+        # （"fire together, wire together"——这是关联图的主要生长途径）
+        self._coactivate(all_chunks)
+
         # 反馈给核心层
         for chunk in all_chunks:
             if chunk.layer == MemoryLayer.CORE:
@@ -435,33 +443,118 @@ class MemoryRetrieval:
         
         return result
     
-    def _expand_via_associations(self, chunks: List[MemoryChunk]) -> List[MemoryChunk]:
+    def _associative_recall(
+        self,
+        seed_chunks: List[MemoryChunk],
+        max_hops: int = 2,
+        hop_decay: float = 0.5,
+        edge_fanout: int = 5,
+        activation_threshold: float = 0.15,
+        limit: int = 5,
+    ) -> List[MemoryChunk]:
         """
-        通过 Hebbian 关联扩展候选碎片
+        扩散激活联想回忆（spreading activation）。
+
+        命中的记忆作为激活源（activation=1.0），激活沿 Hebbian 关联边
+        传播：contribution = 源激活 × 边权 × hop_decay，逐跳衰减，
+        每个节点的激活为累积贡献（封顶 1.0）。
+
+        与人类回忆一致的三个性质：
+        1. 联想距离越远、连接越弱，被想起的概率越低（逐跳 × 边权衰减）
+        2. 多条路径汇聚的记忆更容易被想起（贡献累积）
+        3. 关联本身是唤醒线索——被强激活的归档记忆会被联想唤醒，
+           激活足够强时直接提升回核心层（"想起 A 时把尘封的 B 也带回来了"）
+
+        激活轨迹保存在 self.last_activation_trace，便于审计解释
+        "为什么这条记忆出现在结果里"。
         """
-        if not chunks:
+        if not seed_chunks:
             return []
-        
-        expanded = []
-        for chunk in chunks:
-            # 获取关联最强的记忆
-            if not chunk.associations:
-                continue
-            
-            sorted_assocs = sorted(
-                chunk.associations.items(),
-                key=lambda x: x[1],
-                reverse=True,
-            )
-            
-            # 取前3个关联最强的
-            for assoc_id, assoc_weight in sorted_assocs[:3]:
-                if assoc_weight > 0.3:  # 阈值
-                    assoc_chunk = self.core.get(assoc_id)
-                    if assoc_chunk:
-                        expanded.append(assoc_chunk)
-        
-        return expanded
+
+        activation: Dict[str, float] = {c.id: 1.0 for c in seed_chunks}
+        seed_ids = set(activation.keys())
+        # 非种子节点：id -> (chunk, 激活值)
+        collected: Dict[str, MemoryChunk] = {}
+
+        frontier: List[Tuple[MemoryChunk, float]] = [(c, 1.0) for c in seed_chunks]
+        for _hop in range(max_hops):
+            next_frontier: List[Tuple[MemoryChunk, float]] = []
+            # 排序保证传播顺序确定，结果可复现
+            for src_chunk, src_act in sorted(frontier, key=lambda x: (-x[1], x[0].id)):
+                if not src_chunk.associations:
+                    continue
+                edges = sorted(
+                    src_chunk.associations.items(),
+                    key=lambda x: (-x[1], x[0]),
+                )[:edge_fanout]
+                for assoc_id, edge_weight in edges:
+                    contribution = src_act * edge_weight * hop_decay
+                    if contribution < 0.02:
+                        continue
+                    target = self.core.get(assoc_id) or self.forgotten.get(assoc_id)
+                    if target is None:
+                        continue
+                    new_act = min(1.0, activation.get(assoc_id, 0.0) + contribution)
+                    if new_act <= activation.get(assoc_id, 0.0):
+                        continue
+                    activation[assoc_id] = new_act
+                    if assoc_id not in seed_ids:
+                        collected[assoc_id] = target
+                    next_frontier.append((target, new_act))
+            frontier = next_frontier
+            if not frontier:
+                break
+
+        # 审计轨迹（只记录非种子的联想激活）
+        self.last_activation_trace = sorted(
+            ((cid, activation[cid]) for cid in collected),
+            key=lambda x: (-x[1], x[0]),
+        )
+
+        # 取激活最强的若干条
+        ranked = [
+            (collected[cid], act) for cid, act in self.last_activation_trace
+            if act >= activation_threshold
+        ][:limit]
+
+        recalled: List[MemoryChunk] = []
+        to_promote: List[str] = []
+        for chunk, act in ranked:
+            if chunk.layer == MemoryLayer.FORGOTTEN:
+                # 联想唤醒：关联本身就是线索
+                self.forgotten.record_wake(chunk.id)
+                self.total_assoc_wakes += 1
+                if act >= self.assoc_promote_threshold:
+                    to_promote.append(chunk.id)
+            recalled.append(chunk)
+
+        # 被强激活的归档记忆提升回核心层
+        if to_promote:
+            promoted = {c.id: c for c in self.forgotten.promote(to_promote)}
+            for chunk_id, chunk in promoted.items():
+                self.core.add(chunk)
+                self.core.access(chunk_id)
+                if self.planner:
+                    self.planner.add_chunk(chunk)
+            self.total_promoted += len(promoted)
+            # 用提升后的对象（layer 已置回 CORE）替换返回列表里的旧引用
+            recalled = [promoted.get(c.id, c) for c in recalled]
+
+        self.total_assoc_recalled += len(recalled)
+        return recalled
+
+    def _coactivate(self, chunks: List[MemoryChunk], max_wired: int = 4, strength: float = 0.05):
+        """
+        Hebbian 共激活：同一次检索里一起出现的记忆互相加强关联。
+
+        这是关联图的主要生长途径——没有它，扩散激活面对的是一张空图。
+        只连线前几条核心层记忆：人类的共激活也是选择性的，
+        全连接会让关联图退化成噪声。
+        """
+        core_chunks = [c for c in chunks if c.layer == MemoryLayer.CORE][:max_wired]
+        for i, chunk_a in enumerate(core_chunks):
+            for chunk_b in core_chunks[i + 1:]:
+                self.core.strengthen_association(chunk_a.id, chunk_b.id, strength=strength)
     
     def _assemble(
         self,
@@ -629,6 +722,8 @@ class MemoryRetrieval:
             "core_hit_rate": self.core_hit / max(1, self.total_retrievals),
             "forgotten_hit_rate": self.forgotten_hit / max(1, self.total_retrievals),
             "total_promoted": self.total_promoted,
+            "total_assoc_recalled": self.total_assoc_recalled,
+            "total_assoc_wakes": self.total_assoc_wakes,
             "core_chunks": len(self.core),
             "forgotten_chunks": len(self.forgotten),
         }

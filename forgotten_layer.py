@@ -214,6 +214,15 @@ class ForgottenLayer:
 
         return result
 
+    def record_wake(self, chunk_id: str) -> None:
+        """记录一次成功唤醒并持久化（供联想唤醒等外部线索路径使用）"""
+        chunk = self._store.get(chunk_id)
+        if not chunk:
+            return
+        chunk.successful_recall()
+        chunk.updated_at = time.time()
+        self._store.put(chunk)
+
     def promote(self, chunk_ids: List[str]) -> List[MemoryChunk]:
         """
         把被唤醒的记忆从伪遗忘层移出，交还给核心层。
