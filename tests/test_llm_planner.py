@@ -2,6 +2,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import threading
 
+import pytest
+
+from core.llm_planner import LLMError
 from new_agent_memory import (
     ActionResult,
     AgentAction,
@@ -196,15 +199,116 @@ def test_llm_planner_direct_response_fallback_for_plain_chat():
     assert "answer the user directly" in planner.last_prompt
 
 
-def test_llm_planner_falls_back_for_unknown_tool():
+def test_llm_planner_unknown_tool_does_not_leak_internal_fallback_message():
+    """回归：选中不存在工具时，内部提示不应作为最终答案泄漏给用户，
+    应走修复/直接回复回退路径。"""
     memory = HumanLikeMemorySystem()
     agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
-    planner = LLMPlanner(lambda prompt: '{"name": "delete_world", "arguments": {}}')
+    outputs = iter(
+        [
+            '{"name": "delete_world", "arguments": {}}',
+            '{"name": "delete_world", "arguments": {}}',
+            "抱歉，我直接回答你的问题。",
+        ]
+    )
+    planner = LLMPlanner(lambda prompt: next(outputs))
 
     action = planner(agent.observe("hello"), memory.focus("hello"), agent.tools)
 
     assert action.name == "respond"
-    assert "unavailable tool" in action.arguments["message"]
+    assert action.rationale == "LLMPlanner direct response fallback"
+    assert "unavailable tool" not in action.arguments["message"]
+    assert action.arguments["message"] == "抱歉，我直接回答你的问题。"
+
+
+def test_llm_planner_resolves_case_insensitive_tool_names():
+    """回归：'Introspect' 这类大小写/标点差异不应被当成不存在的工具。"""
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    planner = LLMPlanner(lambda prompt: '{"name": "Introspect", "arguments": {}, "rationale": "check state"}')
+
+    action = planner(agent.observe("check your state"), memory.focus("state"), agent.tools)
+
+    assert action.name == "introspect"
+
+
+def test_llm_planner_does_not_hijack_respond_on_loose_substring_match():
+    """回归：'use ... introspection' 不应劫持已经带有真实回答的 respond。"""
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    planner = LLMPlanner(lambda prompt: '{"name": "respond", "arguments": {"message": "real answer"}}')
+
+    action = planner(
+        agent.observe("I use daily journaling; explain introspection in psychology"),
+        memory.focus("psychology"),
+        agent.tools,
+    )
+
+    assert action.name == "respond"
+    assert action.arguments["message"] == "real answer"
+
+
+def test_llm_planner_requires_adjacent_request_marker_for_tool_override():
+    """回归：请求标记必须紧邻工具名，松散共现不构成明确的工具请求。"""
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+    planner = LLMPlanner(lambda prompt: '{"name": "respond", "arguments": {"message": "direct reply"}}')
+
+    action = planner(
+        agent.observe("introspect is a tool we may need someday; for now just use plain words and answer hello"),
+        memory.focus("hello"),
+        agent.tools,
+    )
+
+    assert action.name == "respond"
+    assert action.arguments["message"] == "direct reply"
+
+
+def test_llm_planner_degrades_gracefully_on_transport_error():
+    """回归：传输层异常不应让整个回合崩溃，应降级为直接回复并记录错误。"""
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+
+    def raising_llm(prompt):
+        raise LLMError("connection refused")
+
+    planner = LLMPlanner(raising_llm)
+
+    action = planner(agent.observe("hello"), memory.focus("hello"), agent.tools)
+
+    assert action.name == "respond"
+    assert action.rationale == "LLMPlanner direct response fallback"
+    assert action.arguments["message"]
+    assert "connection refused" in action.metadata["llm_error"]
+
+
+def test_llm_planner_transport_error_uses_memory_heuristic():
+    memory = HumanLikeMemorySystem()
+    agent = CognitiveAgent(memory_system=memory, auto_consolidate=False)
+
+    def raising_llm(prompt):
+        raise LLMError("connection refused")
+
+    planner = LLMPlanner(raising_llm)
+
+    action = planner(agent.observe("请把这个结论保存成记忆：需要更稳的传输层"), memory.focus("保存"), agent.tools)
+
+    assert action.name == "remember"
+    assert "需要更稳的传输层" in action.arguments["content"]
+    assert "connection refused" in action.metadata["llm_error"]
+
+
+def test_openai_compatible_client_raises_typed_llm_error_on_connection_failure():
+    config = OpenAICompatibleConfig(
+        api_key="test-key",
+        base_url="http://127.0.0.1:9/v1",
+        model="fake-chat-model",
+        timeout=0.5,
+    )
+    client = OpenAICompatibleChatClient(config)
+
+    with pytest.raises(LLMError):
+        client("hello")
 
 
 def test_llm_planner_honors_explicit_tool_request_over_respond():

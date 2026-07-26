@@ -279,11 +279,18 @@ class MemoryExtractor:
         # 调用 LLM
         try:
             response = self.llm_fn(prompt)
-            return self._parse_llm_response(response, episode)
+            specs = self._parse_llm_response(response, episode)
         except Exception as e:
             # LLM 失败时回退到规则抽取
             print(f"[MemoryExtractor] LLM 抽取失败: {e}")
             return self._rule_extract(episode)
+
+        # 返回内容无法解析成任何 spec 也按失败处理：
+        # 静默返回空列表意味着这个 episode 什么都没学到
+        if not specs:
+            print("[MemoryExtractor] LLM 返回无法解析出记忆，回退到规则抽取")
+            return self._rule_extract(episode)
+        return specs
 
     def _build_extraction_prompt(self, episode) -> str:
         """构建 LLM 抽取 prompt"""

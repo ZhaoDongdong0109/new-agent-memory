@@ -14,11 +14,19 @@ import re
 import urllib.error
 import urllib.request
 
-from core.agent_system import ActionResult, AgentAction, Observation, ToolRegistry
+from core.agent_system import ActionResult, AgentAction, Observation, ToolRegistry, has_memory_write_intent
 from core.attention_system import FocusWorkspace
 
 
 LLMCallable = Callable[[str], str]
+
+
+class LLMError(RuntimeError):
+    """LLM 传输层的类型化错误（连接失败、HTTP 错误、响应不可解析等）。
+
+    LLMPlanner 捕获它并降级到启发式/直接回复路径，而不是让整个
+    Agent 回合直接崩溃。继承 RuntimeError 以兼容旧的调用方。
+    """
 
 
 def _parse_bool(value: Optional[str], default: bool = False) -> bool:
@@ -190,16 +198,16 @@ class OpenAICompatibleChatClient:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"OpenAI-compatible API HTTP {exc.code}: {detail[:500]}") from exc
+            raise LLMError(f"OpenAI-compatible API HTTP {exc.code}: {detail[:500]}") from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"OpenAI-compatible API connection failed: {exc}") from exc
+            raise LLMError(f"OpenAI-compatible API connection failed: {exc}") from exc
         except OSError as exc:
-            raise RuntimeError(f"OpenAI-compatible API connection failed: {exc}") from exc
+            raise LLMError(f"OpenAI-compatible API connection failed: {exc}") from exc
 
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"OpenAI-compatible API returned invalid JSON: {raw[:500]}") from exc
+            raise LLMError(f"OpenAI-compatible API returned invalid JSON: {raw[:500]}") from exc
         self.last_response = data
         return self._extract_text(data)
 
@@ -217,7 +225,7 @@ class OpenAICompatibleChatClient:
                 )
         if "output_text" in data:
             return str(data["output_text"])
-        raise RuntimeError("OpenAI-compatible API response did not include message content.")
+        raise LLMError("OpenAI-compatible API response did not include message content.")
 
 
 @dataclass
@@ -486,10 +494,14 @@ class LLMPlanner:
 
         for attempt in range(self.config.json_repair_attempts + 1):
             self.last_prompt = prompt
-            output = self._call_llm(
-                prompt,
-                system_prompt="Return only the JSON action requested by the user prompt.",
-            )
+            try:
+                output = self._call_llm(
+                    prompt,
+                    system_prompt="Return only the JSON action requested by the user prompt.",
+                )
+            except LLMError as exc:
+                # 传输层失败：不再抛出中断整个回合，降级并把错误写入动作 metadata
+                return self._degraded_action_for_llm_error(observation, workspace, tools, exc)
             self.last_output = output
             action = self.parse_action(output, tools)
             if not self._is_parse_fallback(action) or attempt >= self.config.json_repair_attempts:
@@ -593,20 +605,36 @@ Previous invalid output:
             arguments = {"input": arguments}
 
         if self.config.strict_tools and name not in tools.tools:
-            return self._fallback_action(f"Planner selected unavailable tool '{name}'.")
+            resolved = self._resolve_tool_name(str(name), tools)
+            if resolved is None:
+                return self._fallback_action(f"Planner selected unavailable tool '{name}'.")
+            name = resolved
 
         return AgentAction(name=name, arguments=arguments, rationale=rationale)
 
+    @staticmethod
+    def _resolve_tool_name(name: str, tools: ToolRegistry) -> Optional[str]:
+        """大小写不敏感 + 去除标点的宽松匹配，把 'Introspect()' 还原成 'introspect'。"""
+        normalized = re.sub(r"[^0-9a-z一-鿿]", "", name.lower())
+        if not normalized:
+            return None
+        for tool_name in tools.tools:
+            if re.sub(r"[^0-9a-z一-鿿]", "", tool_name.lower()) == normalized:
+                return tool_name
+        return None
+
     def _fallback_action(self, reason: str) -> AgentAction:
+        # 用 metadata 标记回退动作，而不是靠消息前缀字符串匹配识别；
+        # 否则"unavailable tool"这类内部提示会绕过修复/直接回复路径泄漏给用户
         return AgentAction(
             name=self.config.default_action,
             arguments={"message": reason},
             rationale="LLMPlanner fallback",
+            metadata={"planner_fallback": True, "fallback_reason": reason},
         )
 
     def _is_parse_fallback(self, action: AgentAction) -> bool:
-        message = str(action.arguments.get("message", ""))
-        return action.rationale == "LLMPlanner fallback" and message.startswith("Could not parse planner JSON")
+        return bool(getattr(action, "metadata", None) and action.metadata.get("planner_fallback"))
 
     def _heuristic_fallback_action(
         self,
@@ -664,6 +692,12 @@ Previous invalid output:
         return observation.content
 
     def _explicit_tool_request(self, text: str, tools: ToolRegistry) -> Optional[str]:
+        """只在"请求标记紧邻工具名"时才认定用户明确要求调用工具。
+
+        工具名必须按词边界匹配（'introspection' 不算 'introspect'），
+        且 call/use/run 等标记要出现在工具名前面约 3 个词以内，
+        避免松散子串命中劫持规划器已经给出的真实回答。
+        """
         lowered = text.lower()
         request_markers = [
             "call",
@@ -677,90 +711,82 @@ Previous invalid output:
             "执行",
         ]
         negative_markers = [
-            "do not call",
-            "don't call",
-            "do not use",
-            "don't use",
-            "不要调用",
-            "不要使用",
-            "别调用",
-            "别使用",
+            "do not",
+            "don't",
+            "never",
+            "不要",
+            "别",
+            "勿",
+            "禁止",
         ]
         for name in tools.tools:
             if name == "respond":
                 continue
-            tool_name = name.lower()
-            if tool_name not in lowered:
-                continue
-            if any(
-                f"{marker} {tool_name}" in lowered or f"{marker}{tool_name}" in lowered
-                for marker in negative_markers
-            ):
-                continue
             if name == "remember" and not self._has_memory_write_intent(text):
                 continue
-            if any(marker in lowered for marker in request_markers):
-                return name
+            pattern = r"(?<![0-9a-z_])" + re.escape(name.lower()) + r"(?![0-9a-z_])"
+            for match in re.finditer(pattern, lowered):
+                # 约 3 个词的窗口：请求标记必须紧邻工具名
+                window = lowered[max(0, match.start() - 24): match.start()]
+                if any(marker in window for marker in negative_markers):
+                    continue
+                if any(marker in window for marker in request_markers):
+                    return name
             if name == "introspect" and any(
-                marker in lowered for marker in ["introspect", "自省", "认知状态", "内部状态", "查看你自己"]
-            ):
+                marker in lowered for marker in ["自省", "认知状态", "内部状态", "查看你自己"]
+            ) and not any(marker in lowered for marker in negative_markers):
                 return name
         return None
 
     def _has_memory_write_intent(self, text: str) -> bool:
-        lowered = text.lower()
-        negative_markers = [
-            "do not remember",
-            "don't remember",
-            "do not save",
-            "don't save",
-            "do not store",
-            "don't store",
-            "不要记住",
-            "不要保存",
-            "不要存储",
-            "不要记录",
-            "别记住",
-            "别保存",
-            "别记录",
-            "不保存",
-            "不用保存",
-        ]
-        if any(marker in lowered for marker in negative_markers):
-            return False
-        markers = [
-            "remember",
-            "save this",
-            "store this",
-            "record this",
-            "记住",
-            "保存",
-            "存储",
-            "记录",
-            "保存成记忆",
-            "写入记忆",
-        ]
-        return any(marker in lowered for marker in markers)
+        # 与 default_planner 共用同一套判定，见 core.agent_system.has_memory_write_intent
+        return has_memory_write_intent(text)
+
+    def _degraded_action_for_llm_error(
+        self,
+        observation: Observation,
+        workspace: FocusWorkspace,
+        tools: ToolRegistry,
+        error: LLMError,
+    ) -> AgentAction:
+        """传输层失败时的降级：先试启发式，再走直接回复路径，并记录错误。"""
+        reason = f"LLM transport error: {error}"
+        fallback = self._fallback_action(reason)
+        fallback.metadata["llm_error"] = str(error)
+        heuristic = self._heuristic_fallback_action(observation, tools, fallback)
+        if heuristic is not fallback:
+            heuristic.metadata.setdefault("llm_error", str(error))
+            return heuristic
+        return self._direct_response_fallback_action(observation, workspace, reason, llm_error=str(error))
 
     def _direct_response_fallback_action(
         self,
         observation: Observation,
         workspace: FocusWorkspace,
         invalid_output: str,
+        llm_error: Optional[str] = None,
     ) -> AgentAction:
         prompt = self.build_direct_response_prompt(observation, workspace, invalid_output)
         self.last_prompt = prompt
-        output = self._call_llm(
-            prompt,
-            system_prompt="Answer the user directly in natural language. Do not return JSON.",
-        ).strip()
+        try:
+            output = self._call_llm(
+                prompt,
+                system_prompt="Answer the user directly in natural language. Do not return JSON.",
+            ).strip()
+        except LLMError as exc:
+            output = ""
+            if llm_error is None:
+                llm_error = str(exc)
         self.last_output = output
         message = output or "我暂时没有拿到模型的有效输出，请再试一次，或检查当前 API 服务是否稳定。"
-        return AgentAction(
+        action = AgentAction(
             name=self.config.default_action,
             arguments={"message": message},
             rationale="LLMPlanner direct response fallback",
         )
+        if llm_error:
+            action.metadata["llm_error"] = llm_error
+        return action
 
     def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> str:
         complete = getattr(self.llm, "complete", None)

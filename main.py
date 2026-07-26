@@ -503,24 +503,27 @@ class HumanLikeMemorySystem:
 
 请直接返回 JSON，不要有其他内容："""
 
+        # 传输错误必须向上传播：add_raw_memory 的 except 分支会回退到
+        # 规则抽取。在这里吞掉错误并返回 {} 会让回退路径永远不触发，
+        # 产出没有任何检索线索的记忆。
+        result = self.llm_fn(prompt)
+        print(f"[LLM] 原始返回: {result[:200]}...")
+
+        # 尝试解析 JSON
+        import re
+
+        # 移除 markdown 代码块标记
+        result = re.sub(r'```json\s*', '', result)
+        result = re.sub(r'```\s*', '', result)
+
+        # 尝试直接解析
         try:
-            result = self.llm_fn(prompt)
-            print(f"[LLM] 原始返回: {result[:200]}...")
+            return json.loads(result.strip())
+        except json.JSONDecodeError:
+            pass
 
-            # 尝试解析 JSON
-            import re
-
-            # 移除 markdown 代码块标记
-            result = re.sub(r'```json\s*', '', result)
-            result = re.sub(r'```\s*', '', result)
-
-            # 尝试直接解析
-            try:
-                return json.loads(result.strip())
-            except json.JSONDecodeError:
-                pass
-
-            # 提取 JSON 部分（支持嵌套）
+        # 提取 JSON 部分（支持嵌套）
+        try:
             json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', result, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group())
@@ -530,11 +533,11 @@ class HumanLikeMemorySystem:
             end = result.rfind('}')
             if start != -1 and end != -1:
                 return json.loads(result[start:end+1])
+        except json.JSONDecodeError:
+            pass
 
-            return {}
-        except Exception as e:
-            print(f"[LLM] JSON 解析失败: {e}")
-            return {}
+        # 完全无法解析同样按失败处理，触发调用方的规则抽取回退
+        raise ValueError(f"LLM 返回无法解析为 JSON: {result[:100]}...")
 
     def retrieve(
         self,

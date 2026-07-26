@@ -92,8 +92,11 @@ class LocalLLM:
                 result = json.loads(resp.read().decode("utf-8"))
                 return result["choices"][0]["message"]["content"]
         except Exception as e:
-            print(f"[LocalLLM] 调用失败: {e}")
-            return ""
+            # 抛出类型化错误而不是静默返回空串：
+            # 空串与"模型真的返回了空"无法区分，会让上游跳过规则回退路径；
+            # LLMError 让 LLMPlanner 走降级路径、让抽取器回退到规则抽取。
+            from core.llm_planner import LLMError
+            raise LLMError(f"LocalLLM 调用失败 ({self.api_base}): {e}") from e
 
     @classmethod
     def from_env(cls, env_file: str = ".env") -> "LocalLLM":
@@ -115,13 +118,26 @@ class LocalLLM:
                         key, value = line.split("=", 1)
                         os.environ.setdefault(key.strip(), value.strip())
 
+        def _safe_float(name, default):
+            try:
+                return float(os.environ.get(name, default))
+            except (TypeError, ValueError):
+                return default
+
+        def _safe_int(name, default):
+            try:
+                return int(os.environ.get(name, default))
+            except (TypeError, ValueError):
+                return default
+
         return cls(
             api_base=os.environ.get("LOCAL_LLM_API_BASE", "http://localhost:8080/v1"),
             api_key=os.environ.get("LOCAL_LLM_API_KEY", "not-needed"),
             model=os.environ.get("LOCAL_LLM_MODEL", "local-model"),
-            temperature=float(os.environ.get("LOCAL_LLM_TEMPERATURE", "0.1")),
-            max_tokens=int(os.environ.get("LOCAL_LLM_MAX_TOKENS", "1000")),
-            timeout=int(os.environ.get("LOCAL_LLM_TIMEOUT", "60")),
+            # 环境变量格式错误时使用默认值，而不是在导入期崩溃
+            temperature=_safe_float("LOCAL_LLM_TEMPERATURE", 0.1),
+            max_tokens=_safe_int("LOCAL_LLM_MAX_TOKENS", 1000),
+            timeout=_safe_int("LOCAL_LLM_TIMEOUT", 60),
         )
 
 

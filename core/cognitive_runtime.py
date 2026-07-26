@@ -14,10 +14,35 @@ import json
 import time
 import uuid
 
-from core.agent_system import ActionResult, AgentAction, CognitiveAgent, ExperienceEpisode, Observation
+from core.agent_system import (
+    ActionResult,
+    AgentAction,
+    CognitiveAgent,
+    ExperienceEpisode,
+    Observation,
+    tool_name_mentioned,
+)
 
 
 RuntimeFinalizer = Callable[["CognitiveRun"], Union[str, ActionResult, None]]
+
+# 任务文本里出现这些标记时，才把提到的工具视为"必须执行"
+_TOOL_REQUEST_MARKERS = [
+    "call",
+    "use",
+    "run",
+    "execute",
+    "invoke",
+    "then",
+    "调用",
+    "使用",
+    "运行",
+    "执行",
+    "然后",
+    "接着",
+    "先",
+    "再",
+]
 
 
 def _now() -> float:
@@ -109,6 +134,8 @@ class CognitiveRuntime:
         self.agent = agent
         self.config = config or CognitiveRuntimeConfig()
         self.finalizer = finalizer
+        # 守卫拦下 finish 时暂存的草稿答案，会带入下一步观测
+        self._pending_finish_note = ""
         self._register_control_tools()
 
     def run(
@@ -125,49 +152,54 @@ class CognitiveRuntime:
         if hasattr(self.agent.memory, "observe_world"):
             self.agent.memory.observe_world(original)
 
-        goal = self._ensure_goal(original)
+        goal_obj, goal = self._ensure_goal(original)
         steps: List[CognitiveStep] = []
         completed = False
         stop_reason = "max_steps"
+        result: Optional[ActionResult] = None
+        self._pending_finish_note = ""
 
-        for index in range(1, max(1, self.config.max_steps) + 1):
-            step_observation = self._build_step_observation(original, goal, steps, index)
-            workspace = self.agent.build_workspace(step_observation)
-            action = self.agent.select_action(step_observation, workspace)
-            action = self._guard_runtime_action(original, steps, action, index)
-            episode = self.agent.execute_action(
-                step_observation,
-                workspace,
-                action,
-                synthesize=False,
-                consolidate=False,
+        try:
+            for index in range(1, max(1, self.config.max_steps) + 1):
+                step_observation = self._build_step_observation(original, goal, steps, index)
+                workspace = self.agent.build_workspace(step_observation)
+                action = self.agent.select_action(step_observation, workspace)
+                action = self._guard_runtime_action(original, steps, action, index)
+                episode = self.agent.execute_action(
+                    step_observation,
+                    workspace,
+                    action,
+                    synthesize=False,
+                    consolidate=False,
+                )
+                step = self._step_from_episode(index, step_observation, workspace.to_prompt_context(), episode)
+                steps.append(step)
+
+                if action.name == "finish":
+                    completed = True
+                    stop_reason = "finish"
+                    break
+                if self.config.stop_on_failure and not episode.result.success:
+                    stop_reason = "failure"
+                    break
+
+            result = self._final_result(original, goal, steps, completed, stop_reason)
+            run = CognitiveRun(
+                original_observation=original,
+                goal=goal,
+                steps=steps,
+                result=result,
+                completed=completed,
+                stop_reason=stop_reason,
             )
-            step = self._step_from_episode(index, step_observation, workspace.to_prompt_context(), episode)
-            steps.append(step)
 
-            if action.name == "finish":
-                completed = True
-                stop_reason = "finish"
-                break
-            if self.config.stop_on_failure and not episode.result.success:
-                stop_reason = "failure"
-                break
-
-        result = self._final_result(original, goal, steps, completed, stop_reason)
-        run = CognitiveRun(
-            original_observation=original,
-            goal=goal,
-            steps=steps,
-            result=result,
-            completed=completed,
-            stop_reason=stop_reason,
-        )
-
-        if self.config.consolidate:
-            self.agent.experience.consolidate(self.agent.memory, limit=len(steps))
-        if completed:
-            self._complete_goal(goal, result.output)
-        return run
+            if self.config.consolidate:
+                self.agent.experience.consolidate(self.agent.memory, limit=len(steps))
+            return run
+        finally:
+            # 不论正常结束还是中途异常，都要关闭本次运行创建的目标，
+            # 否则永久 active 的目标会污染后续所有注意力工作区
+            self._close_goal(goal_obj, completed, stop_reason, result)
 
     def _register_control_tools(self):
         if "finish" in self.agent.tools.tools:
@@ -195,12 +227,13 @@ class CognitiveRuntime:
             finish,
         )
 
-    def _ensure_goal(self, observation: Observation) -> str:
+    def _ensure_goal(self, observation: Observation):
+        """返回 (本次运行创建的 Goal 对象或 None, 目标描述文本)。"""
         objective = f"Complete user task: {_shorten(observation.content, 180)}"
         if not self.config.auto_goal or not hasattr(self.agent.memory, "start_goal"):
             active = getattr(getattr(self.agent.memory, "attention", None), "goal_stack", None)
             current = active.active() if active and hasattr(active, "active") else None
-            return current.objective if current else objective
+            return None, (current.objective if current else objective)
 
         goal = self.agent.memory.start_goal(
             objective,
@@ -212,16 +245,22 @@ class CognitiveRuntime:
             open_loops=["Decide next action", "Check result", "Finish with a user-facing answer"],
             priority=0.82,
         )
-        return goal.objective
+        return goal, goal.objective
 
-    def _complete_goal(self, objective: str, evidence: str):
-        attention = getattr(self.agent.memory, "attention", None)
-        goal_stack = getattr(attention, "goal_stack", None)
-        if goal_stack is None:
+    def _close_goal(self, goal: Any, completed: bool, stop_reason: str, result: Optional[ActionResult]):
+        """按 goal id 关闭本次运行创建的目标（完成/挂起/放弃）。"""
+        if goal is None or not hasattr(self.agent.memory, "update_goal"):
             return
-        active = goal_stack.active()
-        if active and active.objective == objective and hasattr(self.agent.memory, "update_goal"):
-            self.agent.memory.update_goal(active.id, status="completed", evidence=[_shorten(evidence, 240)])
+        if completed:
+            status = "completed"
+            evidence = _shorten(result.output if result is not None else "", 240)
+        elif stop_reason == "failure":
+            status = "abandoned"
+            evidence = f"Runtime stopped: {stop_reason}"
+        else:
+            status = "suspended"
+            evidence = f"Runtime stopped: {stop_reason}"
+        self.agent.memory.update_goal(goal.id, status=status, evidence=[evidence])
 
     def _build_step_observation(
         self,
@@ -231,6 +270,14 @@ class CognitiveRuntime:
         index: int,
     ) -> Observation:
         trace = self._trace_text(steps)
+        pending_note = ""
+        if self._pending_finish_note:
+            # 上一步被守卫拦下的 finish 草稿，带入本步观测避免答案丢失
+            pending_note = (
+                "\n\nDraft final answer from a blocked finish (not yet delivered):\n"
+                + self._pending_finish_note
+            )
+            self._pending_finish_note = ""
         content = f"""
 CognitiveRuntime step {index}/{self.config.max_steps}
 
@@ -241,7 +288,7 @@ Runtime goal:
 {goal}
 
 Completed steps:
-{trace or "(none yet)"}
+{trace or "(none yet)"}{pending_note}
 
 Choose exactly one next action.
 Runtime rules:
@@ -320,6 +367,9 @@ Runtime rules:
                         f"before required tool '{missing_tools[0]}' runs."
                     ),
                 )
+            dropped_message = self._action_message(action).strip()
+            if dropped_message:
+                self._pending_finish_note = dropped_message
             return AgentAction(
                 name=missing_tools[0],
                 arguments={},
@@ -376,10 +426,15 @@ Runtime rules:
     def _missing_required_tools(self, original: Observation, steps: List[CognitiveStep]) -> List[str]:
         required: List[str] = []
         task = original.content.lower()
+        # 只有任务里出现请求性标记（call/use/then/调用/然后……）时，
+        # 才把提到的工具当成必须执行；并按词边界匹配，
+        # 避免 'research' 误触发 'search' 这类子串命中
+        if not any(marker in task for marker in _TOOL_REQUEST_MARKERS):
+            return []
         for tool_name in self.agent.tools.tools:
             if tool_name in {"respond", "finish", "remember"}:
                 continue
-            if tool_name.lower() in task:
+            if tool_name_mentioned(tool_name, task):
                 required.append(tool_name)
 
         executed = {step.action.name for step in steps}
@@ -413,9 +468,13 @@ Runtime rules:
                 finalized = self.finalizer(run)
             except Exception as exc:
                 return ActionResult(
-                    bool(provisional),
+                    completed,
                     provisional,
-                    metadata={"finalizer_error": f"{type(exc).__name__}: {exc}", "stop_reason": stop_reason},
+                    metadata={
+                        "finalizer_error": f"{type(exc).__name__}: {exc}",
+                        "stop_reason": stop_reason,
+                        "completed": completed,
+                    },
                 )
             if isinstance(finalized, ActionResult) and finalized.output:
                 finalized.metadata.setdefault("stop_reason", stop_reason)
@@ -424,8 +483,9 @@ Runtime rules:
             if isinstance(finalized, str) and finalized.strip():
                 return ActionResult(completed, finalized.strip(), metadata={"kind": "runtime_finalized", "stop_reason": stop_reason})
 
+        # 未完成的运行不能伪装成成功：success 跟随 completed
         return ActionResult(
-            bool(provisional),
+            completed,
             provisional,
             metadata={"kind": "runtime_fallback_final", "stop_reason": stop_reason, "completed": completed},
         )

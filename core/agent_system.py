@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Union
 import json
+import re
 import time
 import uuid
 
@@ -23,6 +24,64 @@ def _now() -> float:
 
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
+
+
+# 明确的"不要写入记忆"表述；命中任意一条时视为用户否定了记忆写入
+MEMORY_WRITE_NEGATIVE_MARKERS = [
+    "do not remember",
+    "don't remember",
+    "do not save",
+    "don't save",
+    "do not store",
+    "don't store",
+    "do not record",
+    "don't record",
+    "不要记住",
+    "不要保存",
+    "不要存储",
+    "不要记录",
+    "别记住",
+    "别保存",
+    "别记录",
+    "不保存",
+    "不用保存",
+]
+
+# 明确的"请写入记忆"表述
+MEMORY_WRITE_MARKERS = [
+    "remember",
+    "save this",
+    "store this",
+    "record this",
+    "记住",
+    "保存",
+    "存储",
+    "记录",
+    "保存成记忆",
+    "写入记忆",
+]
+
+
+def has_memory_write_intent(text: str) -> bool:
+    """判断用户是否明确要求写入记忆；出现否定表述时返回 False。
+
+    default_planner 和 LLMPlanner 共用这一判断，避免
+    "please do NOT remember this secret" 这类否定请求被误存。
+    """
+    lowered = text.lower()
+    if any(marker in lowered for marker in MEMORY_WRITE_NEGATIVE_MARKERS):
+        return False
+    return any(marker in lowered for marker in MEMORY_WRITE_MARKERS)
+
+
+def tool_name_mentioned(tool_name: str, text: str) -> bool:
+    """按词边界匹配工具名，避免 'search' 命中 'research' 这类子串误触发。
+
+    边界只针对 ASCII 字母/数字/下划线，因此中文上下文里的
+    "调用search工具" 仍然可以命中。
+    """
+    pattern = r"(?<![0-9a-z_])" + re.escape(tool_name.lower()) + r"(?![0-9a-z_])"
+    return re.search(pattern, text.lower()) is not None
 
 
 @dataclass
@@ -59,12 +118,14 @@ class AgentAction:
     name: str
     arguments: Dict[str, Any] = field(default_factory=dict)
     rationale: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "arguments": self.arguments,
             "rationale": self.rationale,
+            "metadata": self.metadata,
         }
 
     @classmethod
@@ -73,6 +134,7 @@ class AgentAction:
             name=data.get("name", "respond"),
             arguments=dict(data.get("arguments", {})),
             rationale=data.get("rationale", ""),
+            metadata=dict(data.get("metadata", {})),
         )
 
 
@@ -117,6 +179,8 @@ class ExperienceEpisode:
     focus_context: str = ""
     id: str = field(default_factory=lambda: f"exp_{uuid.uuid4().hex[:10]}")
     created_at: float = field(default_factory=_now)
+    # 0 表示尚未固化；非 0 表示已固化过，重复调用 consolidate 时跳过
+    consolidated_at: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -130,6 +194,7 @@ class ExperienceEpisode:
             "next_policy": self.next_policy,
             "focus_context": self.focus_context,
             "created_at": self.created_at,
+            "consolidated_at": self.consolidated_at,
         }
 
     @classmethod
@@ -145,6 +210,7 @@ class ExperienceEpisode:
             next_policy=data.get("next_policy", ""),
             focus_context=data.get("focus_context", ""),
             created_at=float(data.get("created_at", _now())),
+            consolidated_at=float(data.get("consolidated_at", 0.0)),
         )
 
     def to_memory_text(self) -> str:
@@ -155,6 +221,20 @@ class ExperienceEpisode:
             f"Result: {'success' if self.result.success else 'failure'} - {self.result.output}\n"
             f"Lesson: {self.lesson}\n"
             f"Next policy: {self.next_policy}"
+        )
+
+    def to_compact_memory_text(self) -> str:
+        """运行时回合的紧凑摘要，避免把整段 runtime 脚手架写进长期记忆。"""
+        original_task = str(self.observation.metadata.get("original_task", "")).strip()
+        outcome = " ".join(str(self.result.output).split())
+        if len(outcome) > 240:
+            outcome = "..." + outcome[-237:]
+        return (
+            f"Goal: {self.goal}\n"
+            f"Original task: {original_task}\n"
+            f"Action: {self.action.name}\n"
+            f"Outcome: {'success' if self.result.success else 'failure'} - {outcome}\n"
+            f"Lesson: {self.lesson}"
         )
 
 
@@ -179,11 +259,23 @@ class ExperienceLayer:
         """
         created: List[str] = []
         for episode in self.recent(limit):
-            if episode.reward < 0.35 and not episode.lesson:
+            # 幂等：已固化过的回合直接跳过，避免重复写入记忆和程序
+            if episode.consolidated_at:
+                continue
+            # 低信号回合（含失败）不写入长期记忆；_derive_lesson 永远非空，
+            # 因此这里只按 reward 判断
+            if episode.reward < 0.35:
+                episode.consolidated_at = _now()
                 continue
 
+            if episode.observation.metadata.get("runtime"):
+                # runtime 脚手架观测只固化紧凑摘要，不存原始多 KB 上下文
+                content = episode.to_compact_memory_text()
+            else:
+                content = episode.to_memory_text()
+
             memory_id = memory_system.add_memory(
-                content=episode.to_memory_text(),
+                content=content,
                 memory_type=MemoryType.STORY,
                 topics=["experience", "agent", episode.action.name],
                 importance=_clamp(0.35 + episode.reward * 0.45),
@@ -192,16 +284,43 @@ class ExperienceLayer:
             created.append(memory_id)
 
             if episode.result.success and episode.next_policy:
-                procedure = memory_system.add_procedure(
-                    title=f"Learned policy: {episode.action.name}",
-                    steps=[episode.next_policy],
-                    triggers=[episode.action.name, "experience", "success"],
-                    importance=_clamp(0.45 + episode.reward * 0.4),
-                    confidence=_clamp(0.45 + episode.reward * 0.4),
-                )
-                created.append(procedure.id)
+                title = f"Learned policy: {episode.action.name}"
+                steps = [episode.next_policy]
+                existing = self._find_existing_procedure(memory_system, title, steps)
+                if existing is not None:
+                    # 已学过同样的策略：只记一次使用，不再新增重复程序
+                    self._record_procedure_use(memory_system, existing)
+                    created.append(existing.id)
+                else:
+                    procedure = memory_system.add_procedure(
+                        title=title,
+                        steps=steps,
+                        triggers=[episode.action.name, "experience", "success"],
+                        importance=_clamp(0.45 + episode.reward * 0.4),
+                        confidence=_clamp(0.45 + episode.reward * 0.4),
+                    )
+                    created.append(procedure.id)
+
+            episode.consolidated_at = _now()
 
         return created
+
+    @staticmethod
+    def _find_existing_procedure(memory_system: Any, title: str, steps: List[str]) -> Optional[Any]:
+        """在注意力层里查找 (title, steps) 完全相同的程序记忆。"""
+        attention = getattr(memory_system, "attention", None)
+        for procedure in getattr(attention, "procedures", None) or []:
+            if getattr(procedure, "title", None) == title and list(getattr(procedure, "steps", [])) == list(steps):
+                return procedure
+        return None
+
+    @staticmethod
+    def _record_procedure_use(memory_system: Any, procedure: Any):
+        record = getattr(memory_system, "record_procedure_use", None)
+        if callable(record):
+            record(procedure.id, True)
+        elif hasattr(procedure, "record_use"):
+            procedure.record_use(True)
 
     def to_dict(self) -> Dict[str, Any]:
         return {"episodes": [episode.to_dict() for episode in self.episodes]}
@@ -262,19 +381,32 @@ ResponseSynthesizer = Callable[[Observation, FocusWorkspace, AgentAction, Action
 
 def default_planner(observation: Observation, workspace: FocusWorkspace, tools: ToolRegistry) -> AgentAction:
     """A safe planner that responds unless a tool trigger is obvious."""
-    lower = observation.content.lower()
+    runtime_mode = bool(observation.metadata.get("runtime"))
+    if runtime_mode:
+        # runtime 脚手架文本会提到所有工具名，只允许根据原始任务触发工具，
+        # 回复时也只带原始任务内容，避免把整段脚手架当成答案回显
+        intent = str(observation.metadata.get("original_task") or observation.content)
+    else:
+        intent = observation.content
+
     for tool_name in tools.tools:
-        if tool_name.lower() in lower:
-            return AgentAction(
-                name=tool_name,
-                arguments={"input": observation.content, "workspace": workspace.to_prompt_context()},
-                rationale=f"Observation mentioned tool '{tool_name}'.",
-            )
+        if runtime_mode and tool_name in {"respond", "finish"}:
+            continue
+        if not tool_name_mentioned(tool_name, intent):
+            continue
+        if tool_name == "remember" and not has_memory_write_intent(intent):
+            # 用户明确否定写入记忆（例如 "do not remember this secret"）时不触发
+            continue
+        return AgentAction(
+            name=tool_name,
+            arguments={"input": intent, "workspace": workspace.to_prompt_context()},
+            rationale=f"Observation mentioned tool '{tool_name}'.",
+        )
 
     return AgentAction(
         name="respond",
         arguments={
-            "message": observation.content,
+            "message": intent,
             "context": workspace.to_prompt_context(),
         },
         rationale="No explicit tool trigger; produce a contextual response.",
