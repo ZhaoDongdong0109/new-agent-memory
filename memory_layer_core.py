@@ -145,10 +145,15 @@ class MemoryLayerCore:
         age = time.time() - chunk.created_at
 
         # 时间衰减（指数衰减，关联减缓）
+        # 半衰期按记忆类型分层：故事/经历衰减最慢，交互细节最快
+        # （倍率表见 core/weight_system.py，继承自记忆科学的
+        #  程序性/陈述性记忆分层）
+        from core.weight_system import halflife_multiplier
+        type_half_life = self.decay_half_life * halflife_multiplier(chunk.memory_type)
         assoc_count = len(chunk.associations)
         effective_decay = self.decay_rate * (1 - assoc_count * self.assoc_stability)
         effective_decay = max(effective_decay, 0.01)
-        time_decay = math.exp(-effective_decay * age / self.decay_half_life)
+        time_decay = math.exp(-effective_decay * age / type_half_life)
         time_decay = 0.1 + 0.9 * time_decay  # 归一化到0.1~1.0
 
         # 使用频率（对数增长）

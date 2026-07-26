@@ -414,8 +414,8 @@ new-agent-memory/
 │   ├── llm_planner.py         # 模型无关 LLMPlanner 和 OpenAI Responses 包装
 │   ├── cognitive_state.py     # 自我模型、世界信念、驱动力、行动预期与反思
 │   ├── attention_system.py    # GoalStack、程序记忆、注意力评分与工作区
-│   ├── weight_system.py       # 自适应权重系统实验
-│   ├── emotion_engine.py      # 情绪推断与情绪系数采样
+│   ├── weight_system.py       # 记忆类型与按类型分层的衰减半衰期
+│   ├── topic_vocab.py         # 查询/写入共享的双语主题词汇表
 │   └── persona_layer.py       # 行为反馈与人格适应
 ├── examples/                  # 可运行示例
 └── tests/                     # 行为测试
@@ -427,12 +427,19 @@ new-agent-memory/
 
 ```text
 effective_weight =
-  time_decay
+  time_decay           # 半衰期按记忆类型分层（见下）
   + access_frequency
   + recency
   + time_decay * (emotion_boost + importance + connection_value)
   + association_density
   + recall_bias        # 回忆反馈偏置：被确认的记忆上浮，被纠错的下沉
+```
+
+衰减半衰期按记忆类型分层（程序性/叙事性记忆比一次性交互持久，
+继承记忆科学的遗忘曲线分层）：
+
+```text
+STORY 3.33x > IDEA 2.67x > PREFERENCE 2.0x > FACT 1.33x > INTERACTION 1.0x
 ```
 
 完整的遗忘-唤醒生命周期：
@@ -463,6 +470,22 @@ query -> QueryContext（时间/地点/人物/主题锚点）
 ```
 
 查询侧与写入侧共享一张双语主题词汇表（`core/topic_vocab.py`），中文查询可以命中英文标签的记忆，反之亦然。
+
+### Associative Recall（联想回忆）
+
+检索命中之后还有一步扩散激活（spreading activation）：
+
+```text
+命中记忆（activation = 1.0）
+  -> 沿 Hebbian 关联边传播：contribution = 激活 × 边权 × 0.5/跳
+  -> 多路径汇聚的记忆激活累积（更容易被想起）
+  -> 强激活的归档记忆被联想唤醒，甚至提升回核心层
+```
+
+关联图的生长途径是检索时的 Hebbian 共激活：同一次检索里一起出现的
+记忆互相连线（fire together, wire together）。这让系统表现出
+"因为想起 A 而想起 B"，包括把尘封在伪遗忘层的 B 一并带回来。
+每次联想都有激活轨迹审计（`retrieval.last_activation_trace`）。
 
 ## Attention Model
 
