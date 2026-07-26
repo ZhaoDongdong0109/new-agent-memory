@@ -126,6 +126,16 @@ class HumanLikeMemorySystem:
         from core.supersession import SupersessionEngine
         self.supersession = SupersessionEngine(self.core)
 
+        # 确定性睡眠周期：情景 -> 语义巩固（优先回放 + 锚点聚类 +
+        # 抽取式要点 + 来源归档）。写入累计重要性达到阈值后在
+        # maintain() 中触发（Generative Agents 的 150 折算为 7.5）
+        from core.sleep_cycle import SleepCycle
+        self.sleep_cycle = SleepCycle(
+            self.core, self.forgotten, planner=self.query_planner,
+        )
+        self.sleep_threshold = 7.5
+        self._importance_since_sleep = 0.0
+
         # 人格适应层
         self.persona = PersonaLayer()
 
@@ -289,6 +299,8 @@ class HumanLikeMemorySystem:
             self.core.add(chunk)
             if self.query_planner:
                 self.query_planner.add_chunk(chunk)
+            # 睡眠触发累积：经历得越多，越需要一次巩固
+            self._importance_since_sleep += chunk.importance
 
         # 记录创建审计
         if self.audit_logger:
@@ -521,6 +533,7 @@ class HumanLikeMemorySystem:
         self.core.add(chunk)
         if self.query_planner:
             self.query_planner.add_chunk(chunk)
+        self._importance_since_sleep += chunk.importance
 
         # 记录创建审计
         if self.audit_logger:
@@ -989,16 +1002,47 @@ class HumanLikeMemorySystem:
     
     # ============ 维护 ============
     
+    def sleep(self):
+        """
+        执行一次睡眠巩固（情景 -> 语义）。
+
+        相关的情景记忆被抽象成慢衰减的经验要点（IDEA 类型），
+        个体情景归档到伪遗忘层——线索仍可唤醒，抽象完全可逆。
+        返回 SleepReport（完整审计：每行要点可溯源到来源句）。
+        """
+        report = self.sleep_cycle.sleep(llm_fn=self.llm_fn)
+        self._importance_since_sleep = 0.0
+
+        if self.audit_logger:
+            self.audit_logger.log_security_event(
+                event_type="sleep_consolidation",
+                details={
+                    "replayed": report.replayed,
+                    "clusters": report.clusters,
+                    "gists": report.gists_created,
+                    "archived": len(report.sources_archived),
+                    "edges_pruned": report.edges_pruned,
+                },
+                severity="info",
+            )
+        return report
+
     def maintain(self):
         """
         维护任务：
-        1. 检查需要降级的记忆
-        2. 降级到伪遗忘层
-        3. 清理伪遗忘层
-        4. 衰减长期未使用的记忆
+        1. 睡眠巩固（写入累计重要性达到阈值时）
+        2. 检查需要降级的记忆
+        3. 降级到伪遗忘层
+        4. 清理伪遗忘层
+        5. 衰减长期未使用的记忆
         """
         now = time.time()
         
+        # 睡眠巩固：写入累计重要性达到阈值时执行
+        # （在降级检查之前——先抽象成要点，再让个体情景自然沉降）
+        if self._importance_since_sleep >= self.sleep_threshold:
+            self.sleep()
+
         # 核心层降级检查
         to_degrade = self.core.check_degrade()
         if to_degrade:
