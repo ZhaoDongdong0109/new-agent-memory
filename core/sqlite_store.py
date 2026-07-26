@@ -10,6 +10,7 @@ SQLite 存储后端
 
 import json
 import os
+import re
 import sqlite3
 from typing import Dict, Optional, Set
 
@@ -33,6 +34,12 @@ class SqliteMemoryStore(MemoryStore):
             db_path: SQLite 数据库文件路径
             table_prefix: 表名前缀，用于区分 core/forgotten（如 "core_"）
         """
+        # SQL 语句中的表名以 f-string 拼接（SQLite 不支持标识符占位符），
+        # 因此前缀必须是受限字符集——在构造期一次性校验，
+        # 之后所有 f"{t(...)}" 拼接均为安全的内部常量组合。
+        # 所有参数值一律走 ? 占位符，不参与拼接。
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_prefix or "_"):
+            raise ValueError(f"非法的表名前缀: {table_prefix!r}")
         self.db_path = db_path
         self.table_prefix = table_prefix
         self.conn: Optional[sqlite3.Connection] = None
@@ -238,7 +245,7 @@ class SqliteMemoryStore(MemoryStore):
 
         t = self._table
         cursor = self.conn.execute(
-            f"SELECT * FROM {t('memory_chunks')} WHERE id = ?",
+            f"SELECT * FROM {t('memory_chunks')} WHERE id = ?",  # nosec B608 - 表名是构造期校验的内部常量
             (chunk_id,)
         )
         row = cursor.fetchone()
@@ -254,12 +261,12 @@ class SqliteMemoryStore(MemoryStore):
         # 先删除索引
         for idx_name in ['time_idx', 'topic_idx', 'location_idx', 'person_idx']:
             self.conn.execute(
-                f"DELETE FROM {t(idx_name)} WHERE chunk_id = ?",
+                f"DELETE FROM {t(idx_name)} WHERE chunk_id = ?",  # nosec B608 - 表名是构造期校验的内部常量
                 (chunk_id,)
             )
         # 删除主记录
         cursor = self.conn.execute(
-            f"DELETE FROM {t('memory_chunks')} WHERE id = ?",
+            f"DELETE FROM {t('memory_chunks')} WHERE id = ?",  # nosec B608 - 表名是构造期校验的内部常量
             (chunk_id,)
         )
         self.conn.commit()
@@ -270,7 +277,7 @@ class SqliteMemoryStore(MemoryStore):
         self._ensure_connection()
 
         t = self._table
-        cursor = self.conn.execute(f"SELECT * FROM {t('memory_chunks')}")
+        cursor = self.conn.execute(f"SELECT * FROM {t('memory_chunks')}")  # nosec B608 - 表名是构造期校验的内部常量
         result = {}
         for row in cursor:
             chunk = self._row_to_chunk(row)
@@ -282,7 +289,7 @@ class SqliteMemoryStore(MemoryStore):
         self._ensure_connection()
 
         t = self._table
-        cursor = self.conn.execute(f"SELECT COUNT(*) FROM {t('memory_chunks')}")
+        cursor = self.conn.execute(f"SELECT COUNT(*) FROM {t('memory_chunks')}")  # nosec B608 - 表名是构造期校验的内部常量
         return cursor.fetchone()[0]
 
     def save(self) -> None:
@@ -316,7 +323,7 @@ class SqliteMemoryStore(MemoryStore):
         # 先删除旧索引
         for idx_name in ['time_idx', 'topic_idx', 'location_idx', 'person_idx']:
             self.conn.execute(
-                f"DELETE FROM {t(idx_name)} WHERE chunk_id = ?",
+                f"DELETE FROM {t(idx_name)} WHERE chunk_id = ?",  # nosec B608 - 表名是构造期校验的内部常量
                 (cid,)
             )
 
@@ -357,7 +364,7 @@ class SqliteMemoryStore(MemoryStore):
         # 如果 index_name 已经以 _idx 结尾，直接使用；否则添加 _idx 后缀
         table_name = index_name if index_name.endswith('_idx') else index_name + '_idx'
         cursor = self.conn.execute(
-            f"SELECT chunk_id FROM {t(table_name)} WHERE key = ?",
+            f"SELECT chunk_id FROM {t(table_name)} WHERE key = ?",  # nosec B608 - 表名是构造期校验的内部常量
             (key,)
         )
         return {row[0] for row in cursor}
@@ -369,10 +376,10 @@ class SqliteMemoryStore(MemoryStore):
         t = self._table
         # 清空索引
         for idx_name in ['time_idx', 'topic_idx', 'location_idx', 'person_idx']:
-            self.conn.execute(f"DELETE FROM {t(idx_name)}")
+            self.conn.execute(f"DELETE FROM {t(idx_name)}")  # nosec B608 - 表名是构造期校验的内部常量
 
         # 遍历所有 chunk 重建索引
-        cursor = self.conn.execute(f"SELECT * FROM {t('memory_chunks')}")
+        cursor = self.conn.execute(f"SELECT * FROM {t('memory_chunks')}")  # nosec B608 - 表名是构造期校验的内部常量
         for row in cursor:
             chunk = self._row_to_chunk(row)
             self._update_indexes(chunk)
@@ -387,7 +394,7 @@ class SqliteMemoryStore(MemoryStore):
 
         t = self._table
         cursor = self.conn.execute(
-            f"SELECT value FROM {t('stats')} WHERE key = ?",
+            f"SELECT value FROM {t('stats')} WHERE key = ?",  # nosec B608 - 表名是构造期校验的内部常量
             (key,)
         )
         row = cursor.fetchone()
