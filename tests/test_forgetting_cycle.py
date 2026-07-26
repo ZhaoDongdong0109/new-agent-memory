@@ -135,15 +135,34 @@ def test_successful_recall_feedback_raises_weight(tmp_path):
 # ============ SQLite 后端持久化 ============
 
 def test_sqlite_access_stats_persist(tmp_path):
-    """SQLite 后端 get() 返回副本，access() 必须写回否则统计静默丢失"""
+    """SQLite 后端 get() 返回副本，access() 必须写回否则统计静默丢失
+
+    注意 60 秒访问去抖（狗粮期加入：窗口内重复检索算同一次使用），
+    第二次 access 前把 last_accessed 拨出窗口。
+    """
     system = _make_system(tmp_path, store_backend="sqlite")
     chunk_id = system.add_memory(content="SQLite 后端的记忆", topics=["测试"])
 
     system.core.access(chunk_id)
+
+    # 拨出去抖窗口，模拟一段时间后的再次使用
+    chunk = system.core.get(chunk_id)
+    chunk.last_accessed -= 120
+    system.core._store.put(chunk)
+
     system.core.access(chunk_id)
 
     fresh = system.core.get(chunk_id)
     assert fresh.access_count == 2
+
+
+def test_access_debounce_within_window(tmp_path):
+    """60 秒窗口内的重复访问只计一次（防评测/循环刷爆频率效应）"""
+    system = _make_system(tmp_path)
+    chunk_id = system.add_memory(content="被连续访问的记忆", topics=["测试"])
+    for _ in range(10):
+        system.core.access(chunk_id)
+    assert system.core.get(chunk_id).access_count == 1
 
 
 def test_sqlite_recall_bias_persists(tmp_path):

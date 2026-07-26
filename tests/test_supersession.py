@@ -237,3 +237,35 @@ def test_abstain_when_window_empty(tmp_path):
     assert "2026-06" in result.review_note, (
         f"弃答理由应给出最接近记忆的时间：{result.review_note}"
     )
+
+
+def test_numeric_value_change_supersedes_not_noop(tmp_path):
+    """数字微差是最典型的事实更新，不得被近重复 NOOP 吞掉
+
+    狗粮期实测盲区："版本是 0.1.0" -> "版本是 0.2.0" 整体 Jaccard
+    高于 0.8，曾被判 NOOP，旧版本号继续冒充现状。
+    """
+    system = _make_system(tmp_path)
+    id_v1 = _add_fact(system, "当前发布的版本是 0.1.0",
+                      topics=["版本"], keywords=["版本"])
+    id_v2 = _add_fact(system, "当前发布的版本是 0.2.0",
+                      topics=["版本"], keywords=["版本"])
+
+    assert id_v2 != id_v1, "值变化被误判为近重复"
+    old = system.forgotten.get(id_v1)
+    assert old is not None and old.invalid_at is not None
+    assert old.metadata["superseded_by"] == id_v2
+    assert system.core.get(id_v2).parent_id == id_v1
+
+    result = system.retrieve("现在的版本是多少")
+    ids = [c.id for c in result.chunks]
+    assert id_v1 not in ids, "被取代的旧版本号冒充了现状"
+
+
+def test_true_duplicate_with_same_numbers_still_noop(tmp_path):
+    """数字相同的真重复仍走 NOOP 强化"""
+    system = _make_system(tmp_path)
+    id_a = _add_fact(system, "当前发布的版本是 0.2.0", topics=["版本"])
+    id_b = _add_fact(system, "当前发布的版本是 0.2.0", topics=["版本"])
+    assert id_b == id_a
+    assert len(system.core) == 1

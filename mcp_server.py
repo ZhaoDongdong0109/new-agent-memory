@@ -259,6 +259,18 @@ class MemoryMCPServer:
                                 "type": "array",
                                 "items": {"type": "string"},
                                 "description": "Related topics"
+                            },
+                            "memory_type": {
+                                "type": "string",
+                                "enum": ["interaction", "fact", "preference", "story", "idea"],
+                                "description": (
+                                    "Memory type. 'fact'/'preference' get "
+                                    "bi-temporal supersession (new values replace "
+                                    "old, history preserved) and slower decay; "
+                                    "'story' decays slowest; default 'interaction' "
+                                    "decays fastest. Use 'fact' for durable facts."
+                                ),
+                                "default": "interaction"
                             }
                         },
                         "required": ["content"]
@@ -614,10 +626,46 @@ class MemoryMCPServer:
         }
 
     def _add(self, args: dict) -> dict:
-        """添加记忆（支持 LLM 增强抽取）"""
+        """添加记忆（支持 LLM 增强抽取与记忆类型）"""
         content = args.get("content", "")
         importance = args.get("importance", 0.5)
         topics = args.get("topics", [])
+        memory_type_str = args.get("memory_type", "interaction")
+
+        if memory_type_str != "interaction":
+            # 事实/偏好/故事/想法：抽取锚点后走 add_memory ——
+            # 这样才能进入取代决策表（FACT/PREFERENCE 的双时态管理）
+            # 并按类型使用正确的衰减速率。狗粮期实测：MCP 存的
+            # 事实类知识全按最快衰减的 interaction 处理是真实缺陷。
+            from core.entity_extractor import EntityExtractor
+            from core.weight_system import MemoryType
+
+            extractor = EntityExtractor()
+            persons = extractor.extract_persons(content)
+            location = extractor.extract_location(content)
+            t_abs, t_rel, t_ctx = extractor.extract_time(content)
+            keywords = extractor.extract_keywords(content)
+            merged_topics = extractor.extract_topics(content) | set(topics)
+
+            memory_id = self.memory.add_memory(
+                content=content,
+                memory_type=MemoryType(memory_type_str),
+                persons=list(persons),
+                location=location,
+                time_absolute=t_abs,
+                time_relative=t_rel,
+                time_context=t_ctx,
+                topics=list(merged_topics),
+                keywords=list(keywords),
+                importance=importance,
+                source="system_extract",
+            )
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": f"Memory saved: {memory_id} (type={memory_type_str})",
+                }]
+            }
 
         # 使用 add_raw_memory 进行自动抽取
         # 如果有 LLM，会使用语义抽取；否则使用规则抽取

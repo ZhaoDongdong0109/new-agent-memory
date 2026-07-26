@@ -48,17 +48,35 @@ def test_coretrieved_memories_wire_together(tmp_path):
 
 
 def test_repeated_coactivation_strengthens_edge(tmp_path):
-    """重复共激活使关联边权单调增强（有上限）"""
+    """跨时间的重复共激活使关联边权单调增强（有上限）
+
+    共激活有 60 秒去抖（同窗口内的重复共现是同一次"共同经历"），
+    每轮之间清掉去抖记录以模拟时间流逝。
+    """
     system = _make_system(tmp_path)
     id_a = system.add_memory(content="调试了向量检索的召回问题", keywords=["检索"])
     id_b = system.add_memory(content="检索模块的分数融合需要归一化", keywords=["检索"])
 
     weights = []
     for _ in range(3):
+        system.retrieval._recent_coactivations = {}
         system.retrieve("检索")
         weights.append(system.core.get(id_a).associations.get(id_b, 0.0))
 
     assert weights[0] < weights[1] < weights[2] <= 1.0
+
+
+def test_coactivation_debounced_within_window(tmp_path):
+    """同一窗口内的重复检索不重复加强边权"""
+    system = _make_system(tmp_path)
+    id_a = system.add_memory(content="调试了向量检索的召回问题", keywords=["检索"])
+    id_b = system.add_memory(content="检索模块的分数融合需要归一化", keywords=["检索"])
+
+    system.retrieve("检索")
+    first = system.core.get(id_a).associations.get(id_b, 0.0)
+    for _ in range(5):
+        system.retrieve("检索")
+    assert system.core.get(id_a).associations.get(id_b, 0.0) == first
 
 
 # ============ 扩散激活联想回忆 ============
