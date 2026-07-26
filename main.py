@@ -648,14 +648,15 @@ class HumanLikeMemorySystem:
         query: str,
         allow_forgotten: bool = True,
         user_id: str = "default",
+        limit: Optional[int] = None,
     ) -> ReconstructionResult:
         """
         检索记忆
 
-        返回重组后的记忆
+        返回重组后的记忆。limit 为最终回忆集容量上限（None 不截断）。
         """
         start_time = time.time()
-        result = self.retrieval.retrieve(query, allow_forgotten)
+        result = self.retrieval.retrieve(query, allow_forgotten, limit=limit)
         latency = time.time() - start_time
 
         # 记录检索审计

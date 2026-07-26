@@ -23,7 +23,8 @@ from enum import Enum
 
 class MemoryType(Enum):
     """记忆类型，影响衰减节奏"""
-    STORY = "story"             # 用户故事/经历，衰减最慢
+    PROCEDURE = "procedure"     # 程序性知识/操作流程，最持久（骑车不会忘）
+    STORY = "story"             # 用户故事/经历，衰减很慢
     IDEA = "idea"               # 想法/观点，中慢
     PREFERENCE = "preference"   # 用户偏好，中等
     FACT = "fact"               # 事实信息，中快
@@ -36,6 +37,7 @@ class MemoryType(Enum):
 # 实际时间半衰期，因此"故事比交互细节持久 3 倍多"这一原始意图
 # 现在是运行时行为，而不是文档里的愿望。
 HALFLIFE_MULTIPLIER_BY_TYPE = {
+    MemoryType.PROCEDURE: 600 / 150,    # 4.0（程序性记忆最持久）
     MemoryType.STORY: 500 / 150,        # ≈3.33
     MemoryType.IDEA: 400 / 150,         # ≈2.67
     MemoryType.PREFERENCE: 300 / 150,   # 2.0
@@ -76,6 +78,7 @@ def halflife_multiplier(memory_type) -> float:
 # HALFLIFE_MULTIPLIER_BY_TYPE 一致。
 
 ACTR_DECAY_BY_TYPE = {
+    MemoryType.PROCEDURE: 0.35,
     MemoryType.STORY: 0.38,
     MemoryType.IDEA: 0.42,
     MemoryType.PREFERENCE: 0.44,

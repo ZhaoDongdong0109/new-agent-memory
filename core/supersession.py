@@ -32,9 +32,10 @@ from typing import Optional, Set
 from memory_chunk import MemoryChunk
 from core.weight_system import MemoryType
 
-# 参与取代管理的记忆类型：事实与偏好有"当前值"语义；
+# 参与取代管理的记忆类型：事实/偏好/流程有"当前值"语义
+# （流程会改版：新发布流程取代旧流程）；
 # 故事/交互是事件记录，不存在"被新值取代"
-MANAGED_TYPES = (MemoryType.FACT, MemoryType.PREFERENCE)
+MANAGED_TYPES = (MemoryType.FACT, MemoryType.PREFERENCE, MemoryType.PROCEDURE)
 
 # 决策阈值（具名，可解释）
 NOOP_JACCARD = 0.8        # 近重复判定

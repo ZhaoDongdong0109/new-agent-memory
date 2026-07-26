@@ -368,6 +368,7 @@ class MemoryRetrieval:
         self,
         query: str,
         allow_forgotten: bool = True,
+        limit: Optional[int] = None,
     ) -> ReconstructionResult:
         """
         主检索入口
@@ -378,6 +379,14 @@ class MemoryRetrieval:
         3. 伪遗忘层唤醒（如需要）
         4. 组装 + 审阅
         5. 返回结果
+
+        limit：最终回忆集的容量上限（狗粮期实测：不加上限时单次
+        检索可返回 15 条，客户端被噪声轰炸，且全部 15 条都会被
+        访问计数与共激活"使用"——观测副作用污染关联图与频率效应）。
+        截断发生在访问反馈/共激活之前：只有真正交付的回忆才算
+        "被想起"。直接命中按融合名次保留；为联想/唤醒通路保留
+        少量席位（人类回忆同样是主线几条 + 联想一两条）。
+        None 表示不截断（库内评测与向后兼容）。
         """
         self.total_retrievals += 1
 
@@ -411,6 +420,9 @@ class MemoryRetrieval:
                 retrieval_path = "core"
                 self.core_hit += 1
                 all_chunks = [chunk for chunk, _ in core_results]
+
+        # 直接命中集（融合名次序）：容量截断时的主线保留依据
+        direct_ids = {c.id for c in all_chunks}
 
         # Step 3: 伪遗忘层唤醒
         #
@@ -536,6 +548,20 @@ class MemoryRetrieval:
             all_chunks.append(c)
             seen_ids.add(c.id)
 
+        # Step 3.8: 工作记忆容量截断（在访问反馈/共激活之前——
+        # 只有真正交付的回忆才算"被想起"，落选的尾巴不得污染
+        # 访问计数与关联图）。直接命中按融合名次保留主线席位，
+        # 联想/唤醒通路保留最多 2 个席位。
+        omitted = 0
+        if limit is not None and limit > 0 and len(all_chunks) > limit:
+            direct_part = [c for c in all_chunks if c.id in direct_ids]
+            extra_part = [c for c in all_chunks if c.id not in direct_ids]
+            n_extra = min(2, len(extra_part), max(0, limit - 1))
+            n_direct = min(len(direct_part), limit - n_extra)
+            kept = direct_part[:n_direct] + extra_part[:limit - n_direct]
+            omitted = len(all_chunks) - len(kept)
+            all_chunks = kept
+
         # Step 4: 组装
         assembled = self._assemble(all_chunks, ctx)
 
@@ -570,6 +596,11 @@ class MemoryRetrieval:
             )
             review_result = ReviewResult.QUESTIONABLE
             confidence *= 0.6
+
+        # 容量截断的诚实披露：告诉调用方还有多少条更弱的相关记忆
+        if omitted:
+            omit_note = f"另有 {omitted} 条较弱相关记忆未纳入（可调大 limit）"
+            review_note = f"{review_note}；{omit_note}" if review_note else omit_note
 
         result = ReconstructionResult(
             success=True,
