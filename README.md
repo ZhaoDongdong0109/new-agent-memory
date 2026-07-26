@@ -644,6 +644,13 @@ python -m compileall .
 - 给个人 Agent 增加可解释的长期记忆原型
 - 研究“遗忘机制”本身，而不是只研究语义检索
 
+## Related Projects
+
+- [agent-hub](https://github.com/ZhaoDongdong0109/agent-hub)：本仓库拆分出的
+  多 Agent 通信枢纽（频道 / @提及 / 任务分配 / 纠错 / SSE 实时推送）。
+  通过 `pip install 'agent-hub[memory]'` 可将 hub 对话桥接为本项目的
+  长期记忆——聊天记录不是日志，而是会衰减、会被唤醒的记忆。
+
 ## License
 
 AGPL-3.0-or-later. See [LICENSE](LICENSE).

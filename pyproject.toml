@@ -41,11 +41,9 @@ Issues = "https://github.com/ZhaoDongdong0109/new-agent-memory/issues"
 
 [project.scripts]
 new-agent-memory = "new_agent_memory.cli:main"
-agent-hub = "hub.cli:main"
-hub-sub-agent = "adapters.hub_sub_agent:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["core", "new_agent_memory", "hub", "adapters"]
+packages = ["core", "new_agent_memory"]
 
 # 顶层模块：new_agent_memory 包直接 import 这些模块，
 # 缺少它们时非 editable 安装完全无法使用
