@@ -18,7 +18,7 @@ jobs:
       - name: Install linters
         run: pip install ruff
       - name: Run ruff
-        run: ruff check core/ main.py adapters/ hub/
+        run: ruff check core/ main.py memory_chunk.py memory_layer_core.py forgotten_layer.py retrieval.py mcp_server.py new_agent_memory/
 
   test:
     name: Test (Python ${{ matrix.python-version }})
