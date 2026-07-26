@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
+from core.weight_system import MemoryType
 from main import HumanLikeMemorySystem
 
 
@@ -26,16 +27,54 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_args(chat)
     chat.set_defaults(func=run_chat)
 
+    add = subparsers.add_parser("add", help="Add one memory chunk (no LLM needed).")
+    _add_data_dir_arg(add)
+    add.add_argument("text", help="Memory content to store.")
+    add.add_argument(
+        "--type",
+        dest="memory_type",
+        default=MemoryType.INTERACTION.value,
+        choices=[item.value for item in MemoryType],
+        help="Memory type.",
+    )
+    add.add_argument("--topics", default="", help="Comma separated topics, e.g. a,b.")
+    add.add_argument("--keywords", default="", help="Comma separated keywords, e.g. x,y.")
+    add.add_argument("--importance", type=float, default=0.5, help="Importance in [0, 1].")
+    add.add_argument("--location", default=None, help="Optional location.")
+    add.add_argument("--persons", default="", help="Comma separated person names, e.g. p1,p2.")
+    add.set_defaults(func=run_add)
+
+    search = subparsers.add_parser("search", help="Search stored memories (read-only, no LLM needed).")
+    _add_data_dir_arg(search)
+    search.add_argument("query", help="Query text.")
+    search.add_argument("--limit", type=int, default=0, help="Print at most N chunks (0 = all).")
+    search.set_defaults(func=run_search)
+
+    stats = subparsers.add_parser("stats", help="Print memory statistics (read-only, no LLM needed).")
+    _add_data_dir_arg(stats)
+    stats.set_defaults(func=run_stats)
+
     return parser
 
 
-def _add_common_args(parser: argparse.ArgumentParser):
+def _add_data_dir_arg(parser: argparse.ArgumentParser):
     parser.add_argument("--data-dir", default="./memory_data", help="Directory for memory JSON files.")
+
+
+def _add_common_args(parser: argparse.ArgumentParser):
+    _add_data_dir_arg(parser)
     parser.add_argument("--env-file", default=".env", help="Optional .env file with OpenAI-compatible settings.")
     parser.add_argument("--name", default="openai-compatible-agent", help="Agent name.")
     parser.add_argument("--goal", default="", help="Optional active goal to push before running.")
     parser.add_argument("--fresh", action="store_true", help="Do not load existing memory before running.")
     parser.add_argument("--no-save", action="store_true", help="Do not save memory after running.")
+    parser.add_argument(
+        "--save",
+        "--force-save",
+        dest="force_save",
+        action="store_true",
+        help="With --fresh: save anyway, overwriting existing on-disk memory.",
+    )
     parser.add_argument("--show-action", action="store_true", help="Print selected action metadata.")
     parser.add_argument("--show-summary", action="store_true", help="Print cognitive summary after the turn.")
     parser.add_argument("--runtime", action="store_true", help="Use the multi-step CognitiveRuntime loop.")
@@ -79,11 +118,11 @@ def run_chat(args: argparse.Namespace) -> int:
         command = message.lower()
         if command in {":q", ":quit", ":exit", "q", "quit", "exit"}:
             break
-        if command in {":save", "save"}:
+        if command == ":save":
             memory.save()
             print("saved")
             continue
-        if command in {":summary", "summary"}:
+        if command == ":summary":
             print(json.dumps(memory.get_cognitive_summary(), ensure_ascii=False, indent=2))
             continue
 
@@ -184,9 +223,73 @@ def _print_run(run: Any, args: argparse.Namespace, memory: HumanLikeMemorySystem
         print(json.dumps(memory.get_cognitive_summary(), ensure_ascii=False, indent=2))
 
 
+def run_add(args: argparse.Namespace) -> int:
+    memory = HumanLikeMemorySystem(data_dir=args.data_dir)
+    memory.load()
+    chunk_id = memory.add_memory(
+        content=args.text,
+        memory_type=MemoryType(args.memory_type),
+        topics=_split_csv(args.topics),
+        keywords=_split_csv(args.keywords),
+        importance=args.importance,
+        location=args.location,
+        persons=_split_csv(args.persons),
+    )
+    memory.save()
+    print(chunk_id)
+    return 0
+
+
+def run_search(args: argparse.Namespace) -> int:
+    memory = HumanLikeMemorySystem(data_dir=args.data_dir)
+    memory.load()
+    result = memory.retrieve(args.query)
+    print(
+        f"status={result.review_result.value} "
+        f"path={result.retrieval_path} "
+        f"confidence={result.confidence:.2f}"
+    )
+    chunks = result.chunks[: args.limit] if args.limit > 0 else result.chunks
+    for chunk in chunks:
+        # One chunk per line so output stays machine-friendly.
+        print(" ".join(chunk.content.splitlines()))
+    return 0 if result.success else 1
+
+
+def run_stats(args: argparse.Namespace) -> int:
+    memory = HumanLikeMemorySystem(data_dir=args.data_dir)
+    memory.load()
+    stats = {
+        "data_dir": memory.data_dir,
+        "backend": memory.store_backend,
+        "core_chunks": len(memory.core),
+        "forgotten_chunks": len(memory.forgotten),
+        "attention_goals": len(memory.attention.goal_stack.goals),
+        "attention_procedures": len(memory.attention.procedures),
+    }
+    print(json.dumps(stats, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _split_csv(raw: str) -> Optional[List[str]]:
+    items = [item.strip() for item in (raw or "").split(",") if item.strip()]
+    return items or None
+
+
 def _save_if_needed(memory: HumanLikeMemorySystem, args: argparse.Namespace):
-    if not args.no_save:
-        memory.save()
+    if args.no_save:
+        return
+    if args.fresh and not args.force_save:
+        # --fresh skipped loading, so saving here would overwrite the
+        # on-disk memory with this run's near-empty state. Require an
+        # explicit opt-in instead of destroying data silently.
+        print(
+            "notice: --fresh run not saved to avoid overwriting existing memory; "
+            "pass --save/--force-save to persist it.",
+            file=sys.stderr,
+        )
+        return
+    memory.save()
 
 
 def _configure_stdio():

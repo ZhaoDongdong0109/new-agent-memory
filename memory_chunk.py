@@ -91,6 +91,11 @@ class MemoryChunk:
     access_count: int = 0
     successful_recall_count: int = 0  # 成功被唤醒次数
 
+    # 回忆反馈偏置（-0.25 ~ +0.25）
+    # 由 adjust_after_recall 累积：确认正确的回忆提升，错误回忆降低。
+    # 直接叠加进 calc_weight 的最终权重，让反馈真正影响记忆去留。
+    recall_bias: float = 0.0
+
     # 关联记忆（Hebbian关联）
     associations: Dict[str, float] = field(default_factory=dict)  # chunk_id -> weight
 
@@ -252,6 +257,7 @@ class MemoryChunk:
             "last_accessed": self.last_accessed,
             "access_count": self.access_count,
             "successful_recall_count": self.successful_recall_count,
+            "recall_bias": self.recall_bias,
             "associations": self.associations,
             "review_status": self.review_status,
             "review_note": self.review_note,
@@ -277,11 +283,16 @@ class MemoryChunk:
         data["keywords"] = set(data.get("keywords", []))
         data["emotion_tags"] = set(data.get("emotion_tags", []))
         data["layer"] = MemoryLayer(data.get("layer", "core"))
-        
+
         memory_type_val = data.get("memory_type", "interaction")
         if isinstance(memory_type_val, str):
             data["memory_type"] = MemoryType(memory_type_val)
-        
+
+        # 忽略未知字段：新版本写入的数据可以被旧字段集合安全加载
+        import dataclasses
+        known = {f.name for f in dataclasses.fields(cls)}
+        data = {k: v for k, v in data.items() if k in known}
+
         return cls(**data)
     
     def __repr__(self) -> str:

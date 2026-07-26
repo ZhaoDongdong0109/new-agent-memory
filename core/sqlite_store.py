@@ -84,6 +84,7 @@ class SqliteMemoryStore(MemoryStore):
                 last_accessed REAL,
                 access_count INTEGER DEFAULT 0,
                 successful_recall_count INTEGER DEFAULT 0,
+                recall_bias REAL DEFAULT 0.0,
                 associations TEXT DEFAULT '{{}}',
                 review_status TEXT DEFAULT 'pending',
                 review_note TEXT,
@@ -138,6 +139,7 @@ class SqliteMemoryStore(MemoryStore):
             ("user_id", "TEXT DEFAULT 'default'"),
             ("session_id", "TEXT"),
             ("version", "INTEGER DEFAULT 1"),
+            ("recall_bias", "REAL DEFAULT 0.0"),
         ]
 
         for col_name, col_def in new_columns:
@@ -161,7 +163,7 @@ class SqliteMemoryStore(MemoryStore):
                 emotion_valence, emotion_intensity, emotion_tags,
                 connection_value, importance,
                 created_at, updated_at, last_accessed,
-                access_count, successful_recall_count,
+                access_count, successful_recall_count, recall_bias,
                 associations, review_status, review_note,
                 reconstruction_count, parent_id, metadata,
                 source, confidence, valid_at, invalid_at,
@@ -174,7 +176,7 @@ class SqliteMemoryStore(MemoryStore):
                 :emotion_valence, :emotion_intensity, :emotion_tags,
                 :connection_value, :importance,
                 :created_at, :updated_at, :last_accessed,
-                :access_count, :successful_recall_count,
+                :access_count, :successful_recall_count, :recall_bias,
                 :associations, :review_status, :review_note,
                 :reconstruction_count, :parent_id, :metadata,
                 :source, :confidence, :valid_at, :invalid_at,
@@ -206,6 +208,7 @@ class SqliteMemoryStore(MemoryStore):
             "last_accessed": d.get("last_accessed"),
             "access_count": d.get("access_count", 0),
             "successful_recall_count": d.get("successful_recall_count", 0),
+            "recall_bias": d.get("recall_bias", 0.0),
             "associations": json.dumps(d.get("associations", {}), ensure_ascii=False),
             "review_status": d.get("review_status", "pending"),
             "review_note": d.get("review_note"),

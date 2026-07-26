@@ -20,7 +20,8 @@ def test_add_and_retrieve_memory():
     result = system.retrieve("中午在北京吃了什么")
 
     assert result.success is True
-    assert result.retrieval_path == "core"
+    # 混合检索接入后默认路径是 hybrid；关闭混合检索时退回 core
+    assert result.retrieval_path in ("hybrid", "core")
     assert "烤鸭" in result.assembled_content
 
 
