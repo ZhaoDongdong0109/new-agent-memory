@@ -646,7 +646,7 @@ python -m compileall .
 - [x] 确定性睡眠周期：优先回放的情景→语义巩固（研究议程 #7，session-rollup 切片）
 - [x] Personalized PageRank 联想回忆 + 扇出阻尼（研究议程 #6，HippoRAG 海马体索引）
 - [ ] 睡眠周期第二切片：当前值槽索引 + 槽内乱序矛盾重扫 + MCP 维护工具
-- [ ] 要点支持计数：后续匹配情景增强既有要点而非重复抽象
+- [x] 要点支持计数：后续匹配情景增强既有要点而非重复抽象（图式强化：support_count + 重要性随支持情景总数增长）
 - [ ] 经验复盘 `ConsolidationEngine` 接入 Agent 主循环
 - [ ] LLM 驱动的碎片组装与审阅（可选插件）
 

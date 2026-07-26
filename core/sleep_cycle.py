@@ -48,6 +48,11 @@ MAX_EDGES_PER_CHUNK = 20        # 单点边数上限（保留最强的）
 # 要点句数
 GIST_SENTENCES = 3
 
+# 图式强化：新簇与既有要点的锚点 Jaccard 达到此值时，增强既有
+# 要点而不是重复抽象。阈值高于聚类阈值（0.25）——归并要点比归并
+# 情景要求更强的主题一致性，避免不同主题被吞进同一条要点。
+GIST_REINFORCE_JACCARD = 0.5
+
 
 @dataclass
 class SleepReport:
@@ -55,6 +60,7 @@ class SleepReport:
     replayed: int = 0               # 参与回放的情景数
     clusters: int = 0               # 形成的簇数
     gists_created: List[str] = field(default_factory=list)   # 新要点 id
+    gists_reinforced: List[str] = field(default_factory=list)  # 被强化的既有要点
     sources_archived: List[str] = field(default_factory=list)
     edges_pruned: int = 0
     details: List[Dict] = field(default_factory=list)  # 每簇的可溯源明细
@@ -63,6 +69,7 @@ class SleepReport:
         return (
             f"replayed={self.replayed} clusters={self.clusters} "
             f"gists={len(self.gists_created)} "
+            f"reinforced={len(self.gists_reinforced)} "
             f"archived={len(self.sources_archived)} "
             f"edges_pruned={self.edges_pruned}"
         )
@@ -196,6 +203,103 @@ class SleepCycle:
 
         return {"content": content, "sentence_scores": top}
 
+    # ---------- 3.5 图式强化：新簇归并进既有要点 ----------
+
+    def _gist_candidates(self) -> List[MemoryChunk]:
+        """既有要点候选，一次睡眠只取一遍（SQLite 后端 get_all 是
+        全表反序列化，逐簇全库扫描会成为大库睡眠的主要开销）"""
+        return [
+            c for c in self.core.chunks.values()
+            if c.memory_type == MemoryType.IDEA and c.source == "consolidation"
+        ]
+
+    def _find_matching_gist(
+        self,
+        cluster: List[MemoryChunk],
+        candidates: List[MemoryChunk],
+    ) -> Optional[MemoryChunk]:
+        """
+        找与新簇主题一致的既有要点（图式强化，要点支持计数）。
+
+        记忆科学依据：后续匹配情景应该增强既有图式（schema
+        reinforcement），而不是每次睡眠都重复抽象出一条新要点——
+        否则"和老王开会"这类反复出现的主题每周都会多一条近重复
+        的要点，语义层被自己的抽象淹没。
+        """
+        anchors: Set[str] = set()
+        for c in cluster:
+            anchors |= self._anchors(c)
+        if not anchors:
+            return None
+
+        best, best_sim = None, 0.0
+        for other in candidates:
+            if other.user_id != cluster[0].user_id:
+                continue
+            gist_anchors = self._anchors(other)
+            if not gist_anchors:
+                continue
+            sim = len(anchors & gist_anchors) / len(anchors | gist_anchors)
+            if sim > best_sim or (sim == best_sim and best and other.id < best.id):
+                best, best_sim = other, sim
+        return best if best_sim >= GIST_REINFORCE_JACCARD else None
+
+    def _reinforce_gist(
+        self,
+        gist: MemoryChunk,
+        cluster: List[MemoryChunk],
+        now: float,
+        report: SleepReport,
+    ) -> None:
+        """支持计数 + 重要性随支持情景总数增长 + 来源并入归档"""
+        prev_total = int(gist.metadata.get(
+            "supporting_episodes", len(gist.metadata.get("source_ids", []))
+        ))
+        total = prev_total + len(cluster)
+        gist.metadata["supporting_episodes"] = total
+        gist.metadata["support_count"] = int(gist.metadata.get("support_count", 1)) + 1
+        gist.metadata.setdefault("reinforced_at", []).append(now)
+        gist.metadata["source_ids"] = list(gist.metadata.get("source_ids", [])) + [
+            c.id for c in cluster
+        ]
+        # 重要性与内容前缀都由支持情景总数决定（与新建要点同一公式）
+        gist.importance = min(1.0, 0.6 + 0.05 * total)
+        gist.content = re.sub(
+            r"^经验要点（\d+次相关经历）：",
+            f"经验要点（{total}次相关经历）：",
+            gist.content,
+        )
+        for c in cluster:
+            gist.topics |= c.topics
+            gist.persons |= c.persons
+            gist.keywords |= c.keywords
+            c.metadata["consolidated_into"] = gist.id
+            self.core.remove(c.id)
+            if self.planner:
+                self.planner.remove_chunk(c.id)
+            self.forgotten.archive(c)
+            report.sources_archived.append(c.id)
+            gist.associations[c.id] = 0.6
+        gist.updated_at = now
+        # 必须走 core.add 而不是裸 _store.put：锚点集合变了，核心层
+        # 内存倒排索引（topic_index/person_index）只在 add() 时按
+        # _index_keys 快照回滚重建——裸 put 会让新锚点在常驻进程里
+        # 检索不到直到重启（对抗审查在双后端实证复现的缺陷）
+        self.core.add(gist)
+        if self.planner:
+            # 锚点/内容有变，刷新 BM25/Dense 检索索引
+            self.planner.remove_chunk(gist.id)
+            self.planner.add_chunk(gist)
+        report.gists_reinforced.append(gist.id)
+        report.details.append({
+            "gist_id": gist.id,
+            "reinforced": True,
+            "cluster_size": len(cluster),
+            "source_ids": [c.id for c in cluster],
+            "supporting_episodes": total,
+            "support_count": gist.metadata["support_count"],
+        })
+
     # ---------- 4/5. 主流程 ----------
 
     def sleep(self, llm_fn=None, now: Optional[float] = None) -> SleepReport:
@@ -209,7 +313,17 @@ class SleepCycle:
         clusters = self._cluster(replayed)
         report.clusters = len(clusters)
 
+        # 既有要点候选一次取够；本次新建/强化的要点就地维护进列表，
+        # 后续簇仍能匹配到最新状态
+        candidates = self._gist_candidates()
+
         for cluster in clusters:
+            # 图式强化优先：同主题的既有要点被增强而不是重复抽象
+            existing = self._find_matching_gist(cluster, candidates)
+            if existing is not None:
+                self._reinforce_gist(existing, cluster, now, report)
+                continue
+
             gist_info = self._synthesize_gist(cluster, llm_fn=llm_fn)
 
             pooled_topics: Set[str] = set()
@@ -233,12 +347,16 @@ class SleepCycle:
                     "source_ids": [c.id for c in cluster],
                     "sentence_scores": gist_info["sentence_scores"],
                     "consolidated_at": now,
+                    # 图式强化的计数起点（后续匹配簇会累加）
+                    "supporting_episodes": len(cluster),
+                    "support_count": 1,
                 },
             )
             self.core.add(gist)
             if self.planner:
                 self.planner.add_chunk(gist)
             report.gists_created.append(gist.id)
+            candidates.append(gist)
 
             # 来源归档：抽象是可逆的——线索仍可唤醒具体情景
             for c in cluster:

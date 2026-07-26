@@ -599,11 +599,17 @@ class MemoryMCPServer:
         report = self.memory.sleep()
         lines = [f"Sleep cycle done: {report.summary()}"]
         for detail in report.details:
-            lines.append(
-                f"\ngist {detail['gist_id']} <- {detail['cluster_size']} episodes "
-                f"({', '.join(detail['source_ids'])})"
+            verb = "reinforced by" if detail.get("reinforced") else "<-"
+            suffix = (
+                f" [support x{detail['support_count']}, "
+                f"{detail['supporting_episodes']} episodes total]"
+                if detail.get("reinforced") else ""
             )
-        if not report.gists_created:
+            lines.append(
+                f"\ngist {detail['gist_id']} {verb} {detail['cluster_size']} episodes "
+                f"({', '.join(detail['source_ids'])}){suffix}"
+            )
+        if not report.gists_created and not report.gists_reinforced:
             lines.append("(no clusters large enough to consolidate)")
         return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
