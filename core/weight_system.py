@@ -57,3 +57,46 @@ def halflife_multiplier(memory_type) -> float:
         except ValueError:
             return 1.0
     return HALFLIFE_MULTIPLIER_BY_TYPE.get(memory_type, 1.0)
+
+
+# ============ ACT-R 基线激活参数 ============
+#
+# ACT-R 的记忆强度模型（Anderson & Schooler 1991，30 年实证验证）：
+#
+#   B_i = ln( Σ_j t_j^(-d) )     t_j = 距第 j 次使用的时间
+#   P   = 1 / (1 + exp(-(B - τ) / s))   （检索概率，逻辑斯蒂映射）
+#
+# 一个方程同时产生：幂律遗忘（比指数衰减更符合人类数据）、
+# 频率效应（用得多记得牢）、近因效应（刚用过记得清）。
+# 注：间隔效应需要 Pavlik & Anderson (2005) 的激活依赖衰减扩展，
+# 朴素 BLA 不包含它——留作下一轮（需要按次记录衰减率状态）。
+#
+# d 是衰减速率：越小衰减越慢。按记忆类型分层
+# （故事最持久 -> 交互细节最易忘），持久性排序与
+# HALFLIFE_MULTIPLIER_BY_TYPE 一致。
+
+ACTR_DECAY_BY_TYPE = {
+    MemoryType.STORY: 0.38,
+    MemoryType.IDEA: 0.42,
+    MemoryType.PREFERENCE: 0.44,
+    MemoryType.FACT: 0.47,
+    MemoryType.INTERACTION: 0.50,   # ACT-R 默认 d=0.5
+}
+
+# 逻辑斯蒂映射参数：τ 为激活阈值，s 为噪声尺度。
+# 校准锚点（INTERACTION，单次编码）：
+#   1 分钟前编码  -> B≈-2.0 -> P≈0.97（刚记住）
+#   7 天未使用    -> B≈-6.7 -> P≈0.24（半衰附近，对应原 7 天半衰期设计）
+#   120 天未使用  -> B≈-8.1 -> P≈0.07（可被降级）
+ACTR_THRESHOLD = -5.5
+ACTR_NOISE_SCALE = 1.0
+
+
+def actr_decay(memory_type) -> float:
+    """返回某个记忆类型的 ACT-R 衰减速率 d。容忍字符串值。"""
+    if isinstance(memory_type, str):
+        try:
+            memory_type = MemoryType(memory_type)
+        except ValueError:
+            return 0.50
+    return ACTR_DECAY_BY_TYPE.get(memory_type, 0.50)

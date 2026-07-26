@@ -85,6 +85,7 @@ class SqliteMemoryStore(MemoryStore):
                 access_count INTEGER DEFAULT 0,
                 successful_recall_count INTEGER DEFAULT 0,
                 recall_bias REAL DEFAULT 0.0,
+                access_log TEXT DEFAULT '[]',
                 associations TEXT DEFAULT '{{}}',
                 review_status TEXT DEFAULT 'pending',
                 review_note TEXT,
@@ -140,6 +141,7 @@ class SqliteMemoryStore(MemoryStore):
             ("session_id", "TEXT"),
             ("version", "INTEGER DEFAULT 1"),
             ("recall_bias", "REAL DEFAULT 0.0"),
+            ("access_log", "TEXT DEFAULT '[]'"),
         ]
 
         for col_name, col_def in new_columns:
@@ -163,7 +165,7 @@ class SqliteMemoryStore(MemoryStore):
                 emotion_valence, emotion_intensity, emotion_tags,
                 connection_value, importance,
                 created_at, updated_at, last_accessed,
-                access_count, successful_recall_count, recall_bias,
+                access_count, successful_recall_count, recall_bias, access_log,
                 associations, review_status, review_note,
                 reconstruction_count, parent_id, metadata,
                 source, confidence, valid_at, invalid_at,
@@ -176,7 +178,7 @@ class SqliteMemoryStore(MemoryStore):
                 :emotion_valence, :emotion_intensity, :emotion_tags,
                 :connection_value, :importance,
                 :created_at, :updated_at, :last_accessed,
-                :access_count, :successful_recall_count, :recall_bias,
+                :access_count, :successful_recall_count, :recall_bias, :access_log,
                 :associations, :review_status, :review_note,
                 :reconstruction_count, :parent_id, :metadata,
                 :source, :confidence, :valid_at, :invalid_at,
@@ -209,6 +211,7 @@ class SqliteMemoryStore(MemoryStore):
             "access_count": d.get("access_count", 0),
             "successful_recall_count": d.get("successful_recall_count", 0),
             "recall_bias": d.get("recall_bias", 0.0),
+            "access_log": json.dumps(d.get("access_log", []), ensure_ascii=False),
             "associations": json.dumps(d.get("associations", {}), ensure_ascii=False),
             "review_status": d.get("review_status", "pending"),
             "review_note": d.get("review_note"),
@@ -415,6 +418,7 @@ class SqliteMemoryStore(MemoryStore):
         d["emotion_tags"] = set(json.loads(d.get("emotion_tags") or "[]"))
         d["associations"] = json.loads(d.get("associations") or "{}")
         d["metadata"] = json.loads(d.get("metadata") or "{}")
+        d["access_log"] = json.loads(d.get("access_log") or "[]")
 
         # 转换枚举
         d["memory_type"] = MemoryType(d.get("memory_type", "interaction"))

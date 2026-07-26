@@ -423,17 +423,21 @@ new-agent-memory/
 
 ## Memory Model
 
-权重由多种信号共同决定。关键设计：情绪、重要性、连接价值这些"静态"因子被时间衰减门控，否则它们会构成一个永不衰减的权重下限，导致记忆永远无法被遗忘：
+记忆强度核心是 **ACT-R 基线激活**（Anderson & Schooler，30 年认知科学验证的方程），一个公式同时产生幂律遗忘、频率效应和近因效应：
 
 ```text
+B = ln( Σ_j t_j^(-d) )              # t_j = 距第 j 次使用的时间
+P = 1 / (1 + exp(-(B - τ) / s))     # 保持率（检索概率）
+
 effective_weight =
-  time_decay           # 半衰期按记忆类型分层（见下）
-  + access_frequency
-  + recency
-  + time_decay * (emotion_boost + importance + connection_value)
-  + association_density
+  W_r * P
+  + P * (emotion_boost + importance + connection_value + association_density)
   + recall_bias        # 回忆反馈偏置：被确认的记忆上浮，被纠错的下沉
 ```
+
+- 每条记忆精确保留最近 8 次使用时间戳，更早的使用以 Petrov O(k) 积分近似
+- 静态因子被保持率 P 门控：不被使用的记忆无论多"重要"，P 趋零后权重也趋零——遗忘可达是生命周期的前提
+- 关联强度渐进减缓衰减速率 d（上限 10%），不构成永久权重下限
 
 衰减半衰期按记忆类型分层（程序性/叙事性记忆比一次性交互持久，
 继承记忆科学的遗忘曲线分层）：
@@ -594,8 +598,9 @@ python -m compileall .
 - [x] 可审计弃答：窗口外/已过时的结果不冒充答案
 - [x] 惊奇度门控编码：意外信息编码更强（Titans 思想的确定性内核）
 - [x] MCP Server 集成
-- [ ] 确定性评测套件：ToT-lite 时序生成器 + 知识更新探针 + 容量门（研究议程 #2）
-- [ ] ACT-R 基线激活方程替换手调权重因子（研究议程 #5，评测先行）
+- [x] 确定性评测套件：ToT-lite 时序生成器 + 知识更新探针 + 容量门（研究议程 #2）
+- [x] ACT-R 基线激活方程替换手调权重因子（研究议程 #5，Petrov O(k) 近似）
+- [ ] Pavlik 激活依赖衰减扩展（间隔效应，需按次衰减状态）
 - [ ] Personalized PageRank 联想回忆 + 扇出效应阻尼（研究议程 #6，HippoRAG）
 - [ ] 确定性睡眠周期：优先回放的情景→语义巩固（研究议程 #7）
 - [ ] 经验复盘 `ConsolidationEngine` 接入 Agent 主循环
