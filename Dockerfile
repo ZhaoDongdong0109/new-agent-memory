@@ -9,8 +9,6 @@ WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY core ./core
 COPY new_agent_memory ./new_agent_memory
-COPY hub ./hub
-COPY adapters ./adapters
 COPY forgotten_layer.py main.py memory_chunk.py memory_layer_core.py retrieval.py ./
 
 RUN python -m pip install --upgrade pip \
