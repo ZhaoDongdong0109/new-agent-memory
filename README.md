@@ -471,6 +471,33 @@ query -> QueryContext（时间/地点/人物/主题锚点）
 
 查询侧与写入侧共享一张双语主题词汇表（`core/topic_vocab.py`），中文查询可以命中英文标签的记忆，反之亦然。
 
+### Bi-temporal Facts（双时态事实取代）
+
+FACT / PREFERENCE 记忆的写入经过确定性决策表（`core/supersession.py`），
+每个决策带具名规则 ID 可审计：
+
+```text
+写入新事实
+  ├── 近重复（Jaccard >= 0.8）      -> NOOP：强化既有记忆
+  ├── 同槽扩展（旧内容被覆盖 >= 0.8）-> UPDATE：就地更新，旧内容进 history
+  ├── 同槽换值（相似度 >= 0.25）     -> SUPERSEDE：旧值 invalid_at 置为现在，
+  │                                    归档到伪遗忘层，新值 parent_id 指向旧值
+  └── 新事实                        -> ADD：重要性按惊奇度缩放（Titans 思想）
+```
+
+读取侧按时态路由：
+
+```text
+"小李现在住在哪"  -> 只返回当前有效值（invalid_at 未设置）
+"小李以前住在哪"  -> 沿 parent_id 取代链追溯：奥斯陆 -> 柏林 -> 里斯本
+"2024年3月做了什么" -> 确定性时间窗口过滤（core/time_parser.py）
+窗口内没有记忆     -> 可审计弃答："最接近的相关记忆在 2026-06-20"
+```
+
+"记得你以前住在里斯本"是真实的运行时行为——这正是 2025-2026 各大
+记忆系统评测中最弱的知识更新能力（MemoryAgentBench 显示 SOTA 接近随机），
+而这里的每一步都是确定性规则，无需 LLM 仲裁。
+
 ### Associative Recall（联想回忆）
 
 检索命中之后还有一步扩散激活（spreading activation）：
@@ -561,11 +588,18 @@ python -m compileall .
 - [x] SQLite 持久化后端
 - [x] 向量检索 / BM25 / RRF 混合检索（已接入生产检索路径）
 - [x] 遗忘-唤醒生命周期闭环（降级 → 线索唤醒 → 提升回核心层）
+- [x] 联想回忆：Hebbian 共激活 + 扩散激活 + 联想唤醒归档记忆
+- [x] 双时态事实取代：ADD/UPDATE/SUPERSEDE/NOOP 确定性决策表
+- [x] 时间感知检索：确定性时间表达解析 + 窗口过滤 + 时态路由
+- [x] 可审计弃答：窗口外/已过时的结果不冒充答案
+- [x] 惊奇度门控编码：意外信息编码更强（Titans 思想的确定性内核）
 - [x] MCP Server 集成
-- [ ] 经验复盘与矛盾处理 `ConsolidationEngine`（已实现，待接入 Agent 主循环）
-- [ ] 更强的自然语言线索解析
-- [ ] LLM 驱动的碎片组装与审阅
-- [ ] 真实向量嵌入（当前 Dense 腿为哈希 TF-IDF）
+- [ ] 确定性评测套件：ToT-lite 时序生成器 + 知识更新探针 + 容量门（研究议程 #2）
+- [ ] ACT-R 基线激活方程替换手调权重因子（研究议程 #5，评测先行）
+- [ ] Personalized PageRank 联想回忆 + 扇出效应阻尼（研究议程 #6，HippoRAG）
+- [ ] 确定性睡眠周期：优先回放的情景→语义巩固（研究议程 #7）
+- [ ] 经验复盘 `ConsolidationEngine` 接入 Agent 主循环
+- [ ] LLM 驱动的碎片组装与审阅（可选插件）
 
 ## Positioning
 

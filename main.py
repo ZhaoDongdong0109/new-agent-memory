@@ -121,6 +121,11 @@ class HumanLikeMemorySystem:
             review_confidence_threshold=retrieval_confidence_threshold,
         )
 
+        # 双时态事实取代：FACT/PREFERENCE 写入时的确定性决策表
+        # （ADD / UPDATE / SUPERSEDE / NOOP，每个决策带具名规则可审计）
+        from core.supersession import SupersessionEngine
+        self.supersession = SupersessionEngine(self.core)
+
         # 人格适应层
         self.persona = PersonaLayer()
 
@@ -276,6 +281,11 @@ class HumanLikeMemorySystem:
         if target_layer == MemoryLayer.FORGOTTEN:
             self.forgotten.archive(chunk)
         else:
+            # 写入决策表：FACT/PREFERENCE 可能命中 NOOP/UPDATE/SUPERSEDE，
+            # 返回值非 None 时表示写入已被既有记忆吸收
+            absorbed_id = self._apply_write_decision(chunk)
+            if absorbed_id is not None:
+                return absorbed_id
             self.core.add(chunk)
             if self.query_planner:
                 self.query_planner.add_chunk(chunk)
@@ -290,6 +300,87 @@ class HumanLikeMemorySystem:
             )
 
         return chunk.id
+
+    def _apply_write_decision(self, chunk: MemoryChunk) -> Optional[str]:
+        """
+        对待写入记忆执行取代决策表。
+
+        返回值：
+        - None: 按 ADD 正常写入（惊奇度已用于缩放重要性）
+        - chunk_id: 写入被既有记忆吸收（NOOP 强化 / UPDATE 就地更新），
+          调用方直接返回该 id
+
+        SUPERSEDE 时旧记忆被标记失效并归档到伪遗忘层（"过时"是
+        伪遗忘的正当理由），新记忆 parent_id 指向旧记忆，形成
+        可追溯的双时态链条。
+        """
+        from core.supersession import surprise_scaled_importance
+
+        now = time.time()
+        decision = self.supersession.decide(chunk, now=now)
+
+        if self.audit_logger:
+            self.audit_logger.log_security_event(
+                event_type="memory_write_decision",
+                details=dict(decision.to_audit(), chunk_id=chunk.id),
+                severity="info",
+            )
+
+        if decision.op == "noop":
+            # 近重复：强化既有记忆，不新增
+            self.core.access(decision.target_id)
+            existing = self.core.get(decision.target_id)
+            if existing:
+                existing.successful_recall()
+                self.core._store.put(existing)
+            return decision.target_id
+
+        if decision.op == "update":
+            # 同一事实的更完整版本：就地更新，旧内容进 history
+            existing = self.core.get(decision.target_id)
+            if existing:
+                history = existing.metadata.setdefault("history", [])
+                history.append({
+                    "content": existing.content,
+                    "replaced_at": now,
+                    "version": existing.version,
+                })
+                existing.content = chunk.content
+                existing.keywords |= chunk.keywords
+                existing.topics |= chunk.topics
+                existing.persons |= chunk.persons
+                existing.version += 1
+                existing.updated_at = now
+                existing.confidence = max(existing.confidence, chunk.confidence)
+                # 重新索引（标签可能变化）
+                self.core.add(existing)
+                if self.query_planner:
+                    self.query_planner.add_chunk(existing)
+                return existing.id
+            return None
+
+        if decision.op == "supersede":
+            # 新值取代旧值：旧记忆失效 -> 归档；新记忆携带链条
+            old = self.core.get(decision.target_id)
+            if old:
+                old.invalid_at = now
+                old.metadata["superseded_by"] = chunk.id
+                old.review_note = "superseded"
+                self.core.remove(old.id)
+                if self.query_planner:
+                    self.query_planner.remove_chunk(old.id)
+                self.forgotten.archive(old)
+
+                chunk.parent_id = old.id
+                if chunk.valid_at is None:
+                    chunk.valid_at = now
+            return None  # 新记忆按正常路径写入
+
+        # ADD：惊奇度门控编码——越出乎意料的信息越值得记住
+        if decision.rule_id == "R4_new_fact":
+            chunk.importance = surprise_scaled_importance(chunk.importance, decision.surprise)
+            chunk.metadata["encoding_surprise"] = round(decision.surprise, 4)
+        return None
 
     def add_raw_memory(
         self,

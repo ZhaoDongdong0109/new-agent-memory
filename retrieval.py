@@ -53,7 +53,11 @@ class QueryContext:
     
     # 情绪维度
     emotion_valence: Optional[float] = None
-    
+
+    # 时间窗口与时态（core/time_parser.py 解析）
+    time_window: Optional[Tuple[float, float]] = None  # [t_start, t_end] epoch 秒
+    tense: Optional[str] = None  # "present" / "past" / None
+
     # 元信息
     source_type: str = "query"  # query / photo / audio / ...
     
@@ -246,6 +250,12 @@ class MemoryRetrieval:
         # 主题解析：使用统一双语词汇表（core/topic_vocab.py），
         # 扩展出的标签能同时命中中文与英文写入侧的主题
         ctx.topics.update(extract_query_topics(query))
+
+        # 时间窗口与时态：确定性解析（无时间表达时保持 None，
+        # 管线行为与原来完全一致）
+        from core.time_parser import parse_query_window, query_tense
+        ctx.time_window = parse_query_window(query)
+        ctx.tense = query_tense(query)
         
         # 情绪解析（简化）
         positive_words = ["开心", "高兴", "快乐", "愉快", "棒", "好"]
@@ -403,6 +413,62 @@ class MemoryRetrieval:
                 review_note="没有找到相关记忆",
             )
 
+        # Step 3.2: 时态路由（双时态事实取代的读取侧）
+        outdated_only = False
+        now = time.time()
+        if ctx.tense == "past":
+            # 过去时查询：沿取代链（parent_id）把被取代的历史事实带回来
+            all_chunks = self._follow_supersession_chains(all_chunks)
+        else:
+            # 现在时/无时态查询：排除已失效（被取代）的事实；
+            # 若全部失效则保留并在审阅中标注"已过时"，不冒充现状
+            valid = [
+                c for c in all_chunks
+                if c.invalid_at is None or c.invalid_at > now
+            ]
+            if valid:
+                all_chunks = valid
+            elif all_chunks:
+                outdated_only = True
+
+        # Step 3.3: 时间窗口过滤（查询含显式时间表达时）
+        if ctx.time_window:
+            from core.time_parser import chunk_time_range, windows_overlap
+            in_window = []
+            for c in all_chunks:
+                # 数值窗口重叠，或相对时间标签精确匹配（写入侧存的
+                # 是"10年前"这类原始表述时，标签匹配仍然有效）
+                if windows_overlap(chunk_time_range(c), ctx.time_window):
+                    in_window.append(c)
+                elif ctx.time_relative and ctx.time_relative in (c.time_relative, c.time_context):
+                    in_window.append(c)
+            if in_window:
+                all_chunks = in_window
+            else:
+                # 可审计弃答：窗口内没有记忆时，给出最接近的记忆时间，
+                # 而不是拿窗口外的内容冒充答案
+                nearest = min(
+                    all_chunks,
+                    key=lambda c: min(
+                        abs(chunk_time_range(c)[0] - ctx.time_window[0]),
+                        abs(chunk_time_range(c)[1] - ctx.time_window[1]),
+                    ),
+                )
+                nearest_day = time.strftime(
+                    "%Y-%m-%d", time.localtime(chunk_time_range(nearest)[0])
+                )
+                return ReconstructionResult(
+                    success=False,
+                    chunks=[],
+                    assembled_content="",
+                    review_result=ReviewResult.REJECTED,
+                    retrieval_path=retrieval_path,
+                    confidence=0.0,
+                    review_note=(
+                        f"询问的时间范围内没有记忆；最接近的相关记忆在 {nearest_day}"
+                    ),
+                )
+
         # Step 3.5: 联想回忆（扩散激活）
         # 由命中记忆沿 Hebbian 关联图扩散激活，把"因为想起 A 而想起 B"
         # 变成真实行为；被强激活的归档记忆会被联想唤醒甚至提升。
@@ -419,6 +485,18 @@ class MemoryRetrieval:
         # Step 5: 审阅
         review_result, confidence = self._review(all_chunks, assembled, ctx)
 
+        # 全部结果都是被取代的旧事实：明确标注"已过时"，
+        # 置信度打折，绝不冒充当前状态
+        review_note = ""
+        if outdated_only:
+            superseded_by = all_chunks[0].metadata.get("superseded_by", "")
+            review_note = (
+                f"内容已过时（被 {superseded_by or '更新的记忆'} 取代），"
+                "以下是历史状态而非现状"
+            )
+            review_result = ReviewResult.QUESTIONABLE
+            confidence *= 0.6
+
         result = ReconstructionResult(
             success=True,
             chunks=all_chunks,
@@ -426,6 +504,7 @@ class MemoryRetrieval:
             review_result=review_result,
             retrieval_path=retrieval_path,
             confidence=confidence,
+            review_note=review_note,
         )
 
         # Hebbian 共激活：一起被检索到的记忆互相连线
@@ -549,6 +628,32 @@ class MemoryRetrieval:
 
         self.total_assoc_recalled += len(recalled)
         return recalled
+
+    def _follow_supersession_chains(self, chunks: List[MemoryChunk], max_depth: int = 5) -> List[MemoryChunk]:
+        """
+        过去时查询的取代链追溯。
+
+        双时态链条本身就是检索路径："我以前住在哪"先命中当前事实
+        （奥斯陆），再沿 parent_id 走回被取代的历史值（柏林 -> 里斯本）。
+        被取代的记忆在归档层，链条追溯是它们最可靠的唤醒线索。
+        """
+        result = list(chunks)
+        seen = {c.id for c in chunks}
+        for chunk in chunks:
+            parent_id = chunk.parent_id
+            depth = 0
+            while parent_id and parent_id not in seen and depth < max_depth:
+                ancestor = self.core.get(parent_id) or self.forgotten.get(parent_id)
+                if ancestor is None:
+                    break
+                result.append(ancestor)
+                seen.add(ancestor.id)
+                # 历史事实被想起也留下唤醒痕迹
+                if ancestor.layer == MemoryLayer.FORGOTTEN:
+                    self.forgotten.record_wake(ancestor.id)
+                parent_id = ancestor.parent_id
+                depth += 1
+        return result
 
     def _coactivate(self, chunks: List[MemoryChunk], max_wired: int = 4, strength: float = 0.05):
         """
