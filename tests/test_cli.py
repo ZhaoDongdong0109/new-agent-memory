@@ -132,6 +132,7 @@ def _make_fake_memory(runner):
     class FakeMemory:
         def __init__(self):
             self.save_calls = 0
+            self.maintain_calls = 0
 
         def load(self):
             return False
@@ -147,6 +148,10 @@ def _make_fake_memory(runner):
 
         def get_cognitive_summary(self):
             return {"ok": True}
+
+        def auto_maintain_if_needed(self):
+            # 6 小时限速的维护入口：chat 每轮调用（限速在真实实现里）
+            self.maintain_calls += 1
 
     return FakeMemory()
 
@@ -168,6 +173,9 @@ def test_cli_chat_bare_save_and_summary_go_to_agent(monkeypatch, capsys):
     assert '"ok": true' not in captured.out
     assert "echo:save" in captured.out
     assert "echo:summary" in captured.out
+    # 每个对话轮后调用限速维护入口（睡眠/衰减在长聊里真实可达）
+    assert fake_memory.maintain_calls == 2
+    assert "maintain skipped" not in captured.out
 
 
 def test_cli_chat_colon_commands_and_bare_quit_still_work(monkeypatch, capsys):

@@ -98,11 +98,12 @@ class SleepCycle:
             + 0.5 * surprise
         )
 
-    def _select_replay(self, now: float) -> List[MemoryChunk]:
+    def _select_replay(self, now: float, min_age: float = 0.0) -> List[MemoryChunk]:
         candidates = [
             c for c in self.core.chunks.values()
             if c.memory_type in EPISODIC_TYPES
             and not c.metadata.get("consolidated_into")
+            and (now - c.created_at) >= min_age
         ]
         candidates.sort(key=lambda c: (-self._replay_priority(c, now), c.id))
         return candidates[: self.replay_limit]
@@ -302,12 +303,24 @@ class SleepCycle:
 
     # ---------- 4/5. 主流程 ----------
 
-    def sleep(self, llm_fn=None, now: Optional[float] = None) -> SleepReport:
-        """执行一次睡眠巩固，返回完整审计报告"""
+    def sleep(
+        self,
+        llm_fn=None,
+        now: Optional[float] = None,
+        min_replay_age: float = 0.0,
+    ) -> SleepReport:
+        """执行一次睡眠巩固，返回完整审计报告
+
+        min_replay_age：只回放"沉淀"超过该秒数的情景。后台自动
+        触发的睡眠（聊天中途累计重要性达阈值）必须设非零值——
+        否则刚说完几秒的对话回合就被并簇归档，对话被自己的巩固
+        机制掏空（对抗审查实测：14 轮聊天在第 10 轮被并成一条
+        要点、核心层 14->5）。显式调用保持 0（全量回放）。
+        """
         now = now or time.time()
         report = SleepReport()
 
-        replayed = self._select_replay(now)
+        replayed = self._select_replay(now, min_age=min_replay_age)
         report.replayed = len(replayed)
 
         clusters = self._cluster(replayed)

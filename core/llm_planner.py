@@ -332,6 +332,9 @@ Rules:
 - Keep the answer complete, concise, and actionable.
 - Prefer at most 6 short bullets or 180 Chinese characters unless the user asks for detail.
 
+Recent conversation (older first):
+{str((observation.metadata or {}).get("conversation", "") or "(none)")}
+
 Original user message:
 {observation.content}
 
@@ -522,22 +525,32 @@ class LLMPlanner:
         focus_context = workspace.to_prompt_context()
         audit = json.dumps(workspace.audit[:8], ensure_ascii=False, indent=2)
 
-        prompt = f"""
+        # 多轮对话历史独立成块（来自会话工作记忆），不混进 metadata
+        metadata = dict(observation.metadata or {})
+        conversation = str(metadata.pop("conversation", "") or "")
+        conversation_block = (
+            f"\nRecent conversation (older first):\n{conversation}\n" if conversation else ""
+        )
+
+        head = f"""
 {self.config.system_instructions}
 
 Current focus workspace:
 {focus_context or "(empty)"}
-
+{conversation_block}
 Observation:
 source={observation.source}
 content={observation.content}
-metadata={json.dumps(observation.metadata, ensure_ascii=False)}
+metadata={json.dumps(metadata, ensure_ascii=False)}
+""".strip()
 
+        def build_tail(audit_block: str) -> str:
+            return f"""
 Available tools:
 {tool_descriptions}
 
 Attention audit sample:
-{audit}
+{audit_block}
 
 Return ONLY one JSON object with this shape:
 {{
@@ -548,6 +561,8 @@ Return ONLY one JSON object with this shape:
 
 Rules:
 - `name` must be one of the available tool names.
+- When a tool declares `parameters` (JSON Schema), build `arguments` to satisfy it.
+- Use "Recent conversation" to resolve pronouns and follow-ups; the current Observation stays the task.
 - The current Observation is higher priority than memory, open questions, and focus context.
 - If the user explicitly asks to call/use/run an available tool, choose that tool unless doing so is unsafe.
 - Do not answer an old open question when the current Observation asks for a different task.
@@ -561,9 +576,18 @@ Rules:
 - Do not include markdown outside the JSON.
 """.strip()
 
-        if len(prompt) <= self.config.max_prompt_chars:
-            return prompt
-        return prompt[: self.config.max_prompt_chars] + "\n...[truncated]"
+        # 预算内装配：工具清单、输出契约与规则在提示尾部，绝不能被
+        # 截掉——被截断的规则直接产出坏 JSON（对抗审查实证：旧实现
+        # prompt[:12000] 尾截，最先消失的恰是 JSON 契约）。超预算时
+        # 先弃注意力审计，再压缩头部上下文（工作区/对话块）。
+        tail = build_tail(audit)
+        budget = self.config.max_prompt_chars
+        if len(head) + len(tail) + 1 > budget:
+            tail = build_tail("(omitted for budget)")
+        if len(head) + len(tail) + 1 > budget:
+            keep = max(budget - len(tail) - 30, 200)
+            head = head[:keep] + "\n...[context truncated]"
+        return head + "\n" + tail
 
     def build_repair_prompt(self, invalid_output: str, tools: ToolRegistry, original_prompt: str = "") -> str:
         tool_names = ", ".join(sorted(tools.tools))

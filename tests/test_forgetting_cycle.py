@@ -145,9 +145,11 @@ def test_sqlite_access_stats_persist(tmp_path):
 
     system.core.access(chunk_id)
 
-    # 拨出去抖窗口，模拟一段时间后的再次使用
+    # 拨出去抖窗口，模拟一段时间后的再次使用（去抖锚定在最近一次
+    # 落账事件 access_log[-1]，回拨时间戳需同步回拨日志）
     chunk = system.core.get(chunk_id)
     chunk.last_accessed -= 120
+    chunk.access_log = [t - 120 for t in chunk.access_log]
     system.core._store.put(chunk)
 
     system.core.access(chunk_id)

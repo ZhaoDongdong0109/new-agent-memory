@@ -14,7 +14,7 @@ import re
 import time
 import uuid
 
-from core.attention_system import FocusWorkspace
+from core.attention_system import FocusItem, FocusWorkspace
 from core.weight_system import MemoryType
 
 
@@ -341,6 +341,9 @@ class AgentTool:
     description: str
     handler: ToolHandler
     cost: float = 0.0
+    # 参数 JSON Schema：没有它，模型只能猜参数名（代码里曾到处是
+    # 多别名兜底）。有 schema 的工具在提示里自带参数说明。
+    parameters: Optional[Dict[str, Any]] = None
 
     def run(self, arguments: Dict[str, Any]) -> ActionResult:
         result = self.handler(arguments)
@@ -367,10 +370,17 @@ class ToolRegistry:
             return ActionResult(False, f"{type(exc).__name__}: {exc}")
 
     def describe(self) -> List[Dict[str, Any]]:
-        return [
-            {"name": tool.name, "description": tool.description, "cost": tool.cost}
-            for tool in self.tools.values()
-        ]
+        described = []
+        for tool in self.tools.values():
+            entry: Dict[str, Any] = {
+                "name": tool.name,
+                "description": tool.description,
+                "cost": tool.cost,
+            }
+            if tool.parameters:
+                entry["parameters"] = tool.parameters
+            described.append(entry)
+        return described
 
 
 Planner = Callable[[Observation, FocusWorkspace, ToolRegistry], AgentAction]
@@ -421,6 +431,20 @@ def default_evaluator(observation: Observation, action: AgentAction, result: Act
     return _clamp(0.7 - cost_penalty)
 
 
+class _ExtractionProbe:
+    """MemoryExtractor 期望 episode 形状；对话轮自动编码只有 observation"""
+
+    def __init__(self, observation: Observation):
+        self.id = f"turn_{uuid.uuid4().hex[:8]}"
+        self.observation = observation
+        self.action = None
+        self.result = None
+        self.reward = 0.0
+        self.lesson = ""
+        self.next_policy = ""
+        self.goal = ""
+
+
 class CognitiveAgent:
     """A first digital body for memory-driven agents."""
 
@@ -433,7 +457,11 @@ class CognitiveAgent:
         response_synthesizer: Optional[ResponseSynthesizer] = None,
         experience_layer: Optional[ExperienceLayer] = None,
         auto_consolidate: bool = True,
+        conversation_turns: int = 16,
+        auto_extract: bool = True,
     ):
+        from core.conversation import ConversationBuffer
+
         self.memory = memory_system
         self.name = name
         self.planner = planner
@@ -442,6 +470,12 @@ class CognitiveAgent:
         self.experience = experience_layer or ExperienceLayer()
         self.tools = ToolRegistry()
         self.auto_consolidate = auto_consolidate
+        # 会话工作记忆：多轮对话的连续性（溢出轮归档进长期记忆）
+        self.conversation = ConversationBuffer(max_turns=conversation_turns)
+        # 自动编码：每轮对话后从用户话语规则抽取事实进长期记忆
+        # （走 add_memory 决策表 -> 取代链在聊天里真实生效）
+        self.auto_extract = auto_extract
+        self._extractor = None
         self._register_default_tools()
 
     def observe(self, content: str, source: str = "user", metadata: Optional[Dict[str, Any]] = None) -> Observation:
@@ -458,15 +492,208 @@ class CognitiveAgent:
         if hasattr(self.memory, "observe_world"):
             self.memory.observe_world(observation)
 
+        # 多轮上下文：把既有对话历史（不含本轮）交给规划提示——
+        # 代词指代、"上面那个"从此有处可循。直接赋值而不是
+        # setdefault：调用方復用旧 Observation 时，陈旧的历史块
+        # 不得压过真实缓冲。
+        if self.conversation.turns:
+            observation.metadata["conversation"] = self.conversation.render_context()
+        self.conversation.add("user", observation.content)
+
         workspace = self.build_workspace(observation)
         action = self.select_action(observation, workspace)
-        return self.execute_action(observation, workspace, action, consolidate=consolidate)
+        episode = self.execute_action(observation, workspace, action, consolidate=consolidate)
+
+        reply = episode.result.output if episode.result else ""
+        if reply:
+            self.conversation.add("assistant", reply)
+        self._archive_conversation_overflow()
+        if self.auto_extract:
+            self._auto_encode(observation)
+        # 历史块只服务于本轮提示；留在 metadata 里会随 episode
+        # 持久化，30 轮聊天累计重复存储 50KB+（对抗审查实测）
+        observation.metadata.pop("conversation", None)
+        return episode
 
     def build_workspace(self, observation: Observation) -> FocusWorkspace:
         workspace = self.memory.focus(observation.content, include_forgotten=True)
+        self._merge_production_recall(workspace, observation)
         if hasattr(self.memory, "attach_cognitive_context"):
             self.memory.attach_cognitive_context(workspace, tools=self.tools)
         return workspace
+
+    def _merge_production_recall(self, workspace: FocusWorkspace, observation: Observation) -> None:
+        """把生产检索管线的结果并入注意力工作区
+
+        此前 agent 召回只走 focus() 的词元重叠打分，完全绕过
+        BM25/RRF/双时态/时间窗/容量截断，且不记录访问——ACT-R
+        频率效应与间隔效应对 agent 路径失效。这里补上主通路：
+        retrieve() 命中的记忆按生产规则被"想起"（access 计数、
+        共激活、取代链路由全部生效），再并入工作区供提示使用。
+
+        三道闸（对抗审查实证补上）：
+        1. 查询用原始任务而不是 runtime 脚手架——多 KB 样板文本
+           做查询会给无关记忆刷访问计数、连虚假 Hebbian 边
+        2. QUESTIONABLE（词汇覆盖警告/已过时标注）结果不并入
+           提示——低相关命中不该穿上"记忆"的外衣喂给模型
+        3. 归档的对话片段不并入——自己说过的话被捞回又被想起，
+           自激励回环会让片段免于自然衰减并挤占工作区席位
+        """
+        if not hasattr(self.memory, "retrieve"):
+            return
+        query = str(observation.metadata.get("original_task") or observation.content)
+        try:
+            result = self.memory.retrieve(query, limit=5)
+        except TypeError:
+            # 旧签名（无 limit）容错
+            result = self.memory.retrieve(query)
+        except Exception:
+            return
+        if not getattr(result, "success", False):
+            return
+        review = getattr(result, "review_result", None)
+        questionable = getattr(review, "value", review) == "questionable"
+        merged = 0
+        if not questionable:
+            seen = {item.id for item in workspace.memories}
+            for chunk in result.chunks:
+                if chunk.id in seen:
+                    continue
+                if chunk.metadata.get("conversation_archive"):
+                    continue
+                workspace.memories.append(FocusItem(
+                    id=chunk.id,
+                    item_type="memory",
+                    content=chunk.content,
+                    score=round(float(result.confidence), 4),
+                    reason="hybrid-retrieval",
+                ))
+                seen.add(chunk.id)
+                merged += 1
+        # 插在审计队首：LLM 提示只展示 audit[:8]，追加在尾部的
+        # 记录（含"可能不相关"警告）对模型永远不可见
+        workspace.audit.insert(0, {
+            "stage": "production_recall",
+            "hits": len(result.chunks),
+            "merged": merged,
+            "questionable": questionable,
+            "confidence": round(float(result.confidence), 4),
+            "path": getattr(result, "retrieval_path", ""),
+            "note": getattr(result, "review_note", ""),
+        })
+
+    @staticmethod
+    def _anchored_clauses(text: str, persons) -> str:
+        """按逗号/分号切分子句，只保留含人物锚点的部分"""
+        if not persons:
+            return ""
+        clauses = [c.strip() for c in re.split(r"[，,；;]", text) if c.strip()]
+        if len(clauses) <= 1:
+            return ""
+        kept = [c for c in clauses if any(p in c for p in persons)]
+        if not kept or len(kept) == len(clauses):
+            return ""
+        return "，".join(kept)
+
+    def _archive_conversation_overflow(self) -> None:
+        """溢出的旧对话轮归档进长期记忆（INTERACTION，自然衰减）
+
+        带来源标记（conversation_archive）：这些片段可被显式检索
+        （"上周我们聊过什么"），但不会被 _merge_production_recall
+        自动捞回喂给提示——否则自己说过的话变成"记忆"又被想起，
+        回环强化会让片段免于衰减。归档失败的轮次放回缓冲头部，
+        下一轮重试，而不是无声丢失。
+        """
+        overflow = self.conversation.pop_overflow()
+        if not overflow or not hasattr(self.memory, "add_memory"):
+            return
+        failed = []
+        for turn in overflow:
+            speaker = "用户" if turn.role == "user" else "助手"
+            try:
+                self.memory.add_memory(
+                    content=f"对话片段（{speaker}）：{turn.content}",
+                    importance=0.2,
+                    source="conversation_archive",
+                    metadata={"conversation_archive": True, "role": turn.role},
+                )
+            except Exception:
+                failed.append(turn)
+        if failed:
+            self.conversation.turns[0:0] = failed
+
+    # 疑问/祈使/暂态标记：这些话语不是可长期成立的事实陈述
+    _NON_DECLARATIVE_MARKERS = (
+        "?", "？", "吗", "呢", "怎么", "什么", "为什么", "哪", "几点", "多少",
+        "帮我", "请你", "请帮", "给我", "麻烦", "help me", "please ",
+    )
+    # 自动编码的单句长度上限：整段多子句原话入库会让不相关的
+    # 填充语参与取代判定（"周末我们约了饭"曾把住址事实误取代成
+    # 养猫事实——对抗审查端到端复现）
+    _AUTO_ENCODE_MAX_CHARS = 60
+
+    def _auto_encode(self, observation: Observation) -> None:
+        """每轮对话后自动编码：用户话语中的事实进长期记忆
+
+        规则抽取（无 LLM 依赖）。四道闸（全部来自对抗审查实证）：
+        1. 尊重否定意图："不要记住…"的内容一个字也不进库
+        2. 只编码陈述句：疑问/祈使/暂态话语不是事实
+        3. 单句长度上限：多子句原话的填充语会污染取代判定
+        4. 必须有人物锚点或明确偏好标记：地点/话题词典太宽，
+           "帮我写个测试"不该成为永久 FACT
+        写入走 add_memory 决策表——重复陈述被 NOOP 强化，改口走
+        SUPERSEDE 取代链。provenance 落库（source=system_extract、
+        置信度/重要性低于显式写入）。
+        """
+        if observation.source != "user" or not hasattr(self.memory, "add_memory"):
+            return
+        text = observation.content or ""
+        lowered = text.lower()
+        if any(m in lowered for m in MEMORY_WRITE_NEGATIVE_MARKERS):
+            return  # 用户明确拒绝记录——自动编码不得绕过否定意图
+        if len(text) > self._AUTO_ENCODE_MAX_CHARS:
+            return
+        if any(m in lowered for m in self._NON_DECLARATIVE_MARKERS):
+            return
+        if self._extractor is None:
+            from core.memory_extractor import MemoryExtractor
+            self._extractor = MemoryExtractor()
+        probe = _ExtractionProbe(observation)
+        try:
+            result = self._extractor.extract(probe)
+        except Exception:
+            return
+        preference_marker = any(m in text for m in ("喜欢", "偏好", "讨厌", "习惯"))
+        for spec in result.specs:
+            if spec.metadata.get("kind") != "fact":
+                continue  # 经验/程序类交给回合固化，避免双写
+            if not spec.persons and not preference_marker:
+                continue  # 地点/话题词典太宽，单靠它们不足以断定"事实"
+            # 只保留承载锚点的子句：整句入库时，无关填充语
+            # （"周末我们约了饭"）会参与取代判定，曾把住址事实
+            # 误取代成养猫事实（对抗审查端到端复现）
+            content = self._anchored_clauses(spec.content, spec.persons) or spec.content
+            try:
+                self.memory.add_memory(
+                    content=content,
+                    memory_type=spec.memory_type,
+                    persons=list(spec.persons),
+                    topics=list(spec.topics),
+                    keywords=list(spec.keywords),
+                    time_absolute=spec.time_absolute,
+                    time_relative=spec.time_relative,
+                    location=spec.location,
+                    # 自动编码的置信度/重要性必须低于显式写入
+                    # （惊奇度缩放后仍不超过显式 remember 的水平）
+                    importance=min(spec.importance, 0.4),
+                    confidence=0.6,
+                    source="system_extract",
+                    metadata=dict(spec.metadata, auto_encoded=True),
+                    emotion_valence=spec.emotion_valence,
+                    emotion_intensity=spec.emotion_intensity,
+                )
+            except Exception:
+                return
 
     def select_action(self, observation: Observation, workspace: FocusWorkspace) -> AgentAction:
         return self.planner(observation, workspace, self.tools)
@@ -515,8 +742,18 @@ class CognitiveAgent:
 
         return episode
 
-    def add_tool(self, name: str, description: str, handler: ToolHandler, cost: float = 0.0):
-        self.tools.register(AgentTool(name=name, description=description, handler=handler, cost=cost))
+    def add_tool(
+        self,
+        name: str,
+        description: str,
+        handler: ToolHandler,
+        cost: float = 0.0,
+        parameters: Optional[Dict[str, Any]] = None,
+    ):
+        self.tools.register(AgentTool(
+            name=name, description=description, handler=handler,
+            cost=cost, parameters=parameters,
+        ))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -579,9 +816,30 @@ class CognitiveAgent:
         return synthesized
 
     def _register_default_tools(self):
-        self.add_tool("respond", "Return a context-aware text response.", self._respond_tool)
-        self.add_tool("remember", "Store memory only when the user explicitly asks to remember/save/record something.", self._remember_tool)
-        self.add_tool("introspect", "Read current self-model, drives, world beliefs, and open questions.", self._introspect_tool)
+        self.add_tool(
+            "respond", "Return a context-aware text response.", self._respond_tool,
+            parameters={
+                "type": "object",
+                "properties": {"message": {"type": "string", "description": "Final user-facing answer."}},
+                "required": ["message"],
+            },
+        )
+        self.add_tool(
+            "remember",
+            "Store memory only when the user explicitly asks to remember/save/record something.",
+            self._remember_tool,
+            parameters={
+                "type": "object",
+                "properties": {"content": {"type": "string", "description": "The information to store."}},
+                "required": ["content"],
+            },
+        )
+        self.add_tool(
+            "introspect",
+            "Read current self-model, drives, world beliefs, and open questions.",
+            self._introspect_tool,
+            parameters={"type": "object", "properties": {}},
+        )
 
     def _respond_tool(self, arguments: Dict[str, Any]) -> ActionResult:
         message = (

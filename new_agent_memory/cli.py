@@ -133,6 +133,17 @@ def run_chat(args: argparse.Namespace) -> int:
             episode = runner.run_turn(message)
             _print_episode(episode, args, memory)
 
+        # 每轮后维护：走 6 小时限速的 auto_maintain_if_needed，
+        # 睡眠巩固/衰减降级在长聊里真实可达。不能每轮裸调
+        # maintain()：decay_all_unused 每次调用都无条件扣减闲置
+        # 记忆的访问计数，会把"按时间衰减"变成"按聊天轮数衰减"
+        # （对抗审查实测 5 轮聊掉 5 次访问计数）。
+        if hasattr(memory, "auto_maintain_if_needed"):
+            try:
+                memory.auto_maintain_if_needed()
+            except Exception as exc:  # 维护失败不打断对话
+                print(f"[maintain skipped: {exc}]")
+
     _save_if_needed(memory, args)
     return 0
 

@@ -117,19 +117,37 @@ def test_small_clusters_not_abstracted(tmp_path):
 
 
 def test_maintain_triggers_sleep_at_threshold(tmp_path):
+    """自动触发的睡眠只回放沉淀 >=10 分钟的情景
+
+    刚发生的对话回合不参与巩固（你不会把正在说的话拿去做梦）；
+    沉淀过的情景照常抽象成要点。
+    """
     system = _make_system(tmp_path)
     system.sleep_threshold = 2.0  # 降低阈值便于测试
 
-    _add_cluster(system, n=4)  # 4 * 0.6 = 2.4 >= 2.0
+    ids = _add_cluster(system, n=4)  # 4 * 0.6 = 2.4 >= 2.0
     assert system._importance_since_sleep >= 2.0
 
+    # 先验证新鲜情景不被自动睡眠吞掉
     system.maintain()
     assert system._importance_since_sleep == 0.0, "maintain 未触发睡眠"
-    gists = [
-        c for c in system.core.chunks.values()
-        if c.source == "consolidation"
+    fresh_gists = [
+        c for c in system.core.chunks.values() if c.source == "consolidation"
     ]
-    assert gists, "触发的睡眠没有产生要点"
+    assert not fresh_gists, "刚写入的情景不该被自动睡眠即时归档"
+    assert all(system.core.get(cid) is not None for cid in ids)
+
+    # 情景沉淀 15 分钟后，自动睡眠正常巩固
+    for cid in ids:
+        chunk = system.core.get(cid)
+        chunk.created_at -= 900
+        system.core._store.put(chunk)
+    system._importance_since_sleep = system.sleep_threshold
+    system.maintain()
+    gists = [
+        c for c in system.core.chunks.values() if c.source == "consolidation"
+    ]
+    assert gists, "沉淀后的情景应被自动睡眠抽象成要点"
 
 
 def test_graph_hygiene_prunes_weak_edges(tmp_path):
