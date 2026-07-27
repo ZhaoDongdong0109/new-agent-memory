@@ -647,6 +647,8 @@ python -m compileall .
 - [x] Personalized PageRank 联想回忆 + 扇出阻尼（研究议程 #6，HippoRAG 海马体索引）
 - [ ] 睡眠周期第二切片：当前值槽索引 + 槽内乱序矛盾重扫 + MCP 维护工具
 - [x] 要点支持计数：后续匹配情景增强既有要点而非重复抽象（图式强化：support_count + 重要性随支持情景总数增长）
+- [x] 大脑主循环 v1：多轮会话工作记忆（溢出归档）+ 生产检索接入 agent 召回（ACT-R/间隔效应在对话里生效）+ 聊天自动编码（改口走取代链）+ 工具参数 Schema + 聊天内睡眠可达
+- [ ] 大脑主循环 v2：原生 tool-calling 消息协议 + 流式输出 + runtime 多步路径接入会话缓冲/自动编码 + MCP 客户端（消费外部工具）
 - [ ] 经验复盘 `ConsolidationEngine` 接入 Agent 主循环
 - [ ] LLM 驱动的碎片组装与审阅（可选插件）
 

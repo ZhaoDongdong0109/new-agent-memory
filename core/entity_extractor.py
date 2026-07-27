@@ -9,6 +9,14 @@
 import re
 from typing import Dict, List, Optional, Set, Tuple
 
+# 称呼式主语模式的已知误报（词形像"小X/老X"但不是人名）。
+# 黑名单是开放类兜底，主防线是谓词锚定只留强人称动词。
+_PERSON_FALSE_POSITIVES = {
+    "小时", "小心", "老是", "老家", "老板娘", "小说", "老虎", "小区",
+    "小米", "小学", "小组", "小队", "小狗", "小猫", "小孩", "老板",
+    "老乡", "老天", "阿里", "老规", "小两",
+}
+
 
 class EntityExtractor:
     """
@@ -94,6 +102,20 @@ class EntityExtractor:
                 name = match[0].strip()
                 if self._is_valid_name(name):
                     persons.add(name)
+
+        # 模式2：称呼式人名做主语（小李住在… / 老王说… / 阿强搬到…）。
+        # 此前只认"和X"句式，"小李现在住在里斯本"连人物都抽不出，
+        # 事实门控永远不过——自动编码与取代链在聊天路径上形同虚设。
+        # 谓词锚定只留强人称动词（说/住/搬/教/娶/嫁）与时间副词+
+        # 强动词组合："是/在/有/要"这类弱谓词会把小米/小学/老板
+        # 全部错认成人（对抗审查实证）。开放类误报由黑名单兜底。
+        subject_pattern = (
+            r"(?:^|[，。；！？\s])([小老阿][一-鿿])"
+            r"(?=(?:现在|最近|今天|昨天|以前)?(?:说|住|搬|教|娶|嫁|养))"
+        )
+        for name in re.findall(subject_pattern, text):
+            if self._is_valid_name(name) and name not in _PERSON_FALSE_POSITIVES:
+                persons.add(name)
 
         return persons
 

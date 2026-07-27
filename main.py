@@ -241,7 +241,10 @@ class HumanLikeMemorySystem:
 
         返回记忆ID
         """
-        # PII 检测与脱敏
+        # PII 检测与脱敏。注意：keywords/persons/topics 往往是从
+        # 原文抽取的碎片，content 脱敏后它们仍可能携带原文 PII 并
+        # 进入 BM25 索引（对抗审查实证的泄漏通道）——锚点字段必须
+        # 一并脱敏。
         if self.pii_handler and self.pii_handler.has_pii(content):
             pii_types = list(self.pii_handler.get_pii_types(content))
             content = self.pii_handler.redact(content)
@@ -255,6 +258,11 @@ class HumanLikeMemorySystem:
                     pii_types=pii_types,
                     action="redact",
                 )
+        if self.pii_handler:
+            keywords = [
+                k for k in (keywords or [])
+                if not self.pii_handler.has_pii(str(k))
+            ] or None
 
         chunk = MemoryChunk(
             content=content,
@@ -339,10 +347,21 @@ class HumanLikeMemorySystem:
             )
 
         if decision.op == "noop":
-            # 近重复：强化既有记忆，不新增
+            # 近重复：强化既有记忆，不新增。successful_recall 与
+            # access 同窗去抖——复述不是"系统检索被确认正确"，
+            # 60 秒内的连发不应无上限抬高检索置信度（对抗审查实测
+            # 同句 3 连发曾把 QUESTIONABLE 抬成 MODIFIED）。
+            before = self.core.get(decision.target_id)
+            in_window = bool(
+                before is not None
+                and before.access_count > 0
+                and before.access_log
+                and time.time() - before.access_log[-1]
+                < before.ACCESS_DEBOUNCE_SECONDS
+            )
             self.core.access(decision.target_id)
             existing = self.core.get(decision.target_id)
-            if existing:
+            if existing and not in_window:
                 existing.successful_recall()
                 self.core._store.put(existing)
             return decision.target_id
@@ -490,8 +509,11 @@ class HumanLikeMemorySystem:
                 # 再次复习"，必须带 Pavlik 事件衰减——否则突击式
                 # 重复存储每次都记下最耐久的基线痕迹，间隔效应在
                 # 这个入口被系统性绕过（对抗审查发现）。
-                existing.access(decay=self.core._rehearsal_decay(existing))
-                existing.successful_recall()
+                # successful_recall 与 access 同窗去抖：60 秒内的
+                # 重复灌入不重复计"成功回忆"。
+                recorded = existing.access(decay=self.core._rehearsal_decay(existing))
+                if recorded:
+                    existing.successful_recall()
                 existing.version += 1
                 existing.updated_at = time.time()
                 self.core._store.put(existing)
@@ -1007,15 +1029,17 @@ class HumanLikeMemorySystem:
     
     # ============ 维护 ============
     
-    def sleep(self):
+    def sleep(self, min_replay_age: float = 0.0):
         """
         执行一次睡眠巩固（情景 -> 语义）。
 
         相关的情景记忆被抽象成慢衰减的经验要点（IDEA 类型），
         个体情景归档到伪遗忘层——线索仍可唤醒，抽象完全可逆。
         返回 SleepReport（完整审计：每行要点可溯源到来源句）。
+        min_replay_age：只回放沉淀超过该秒数的情景（后台自动
+        触发时用，防止刚发生的对话回合被即时归档）。
         """
-        report = self.sleep_cycle.sleep(llm_fn=self.llm_fn)
+        report = self.sleep_cycle.sleep(llm_fn=self.llm_fn, min_replay_age=min_replay_age)
         self._importance_since_sleep = 0.0
 
         if self.audit_logger:
@@ -1045,9 +1069,11 @@ class HumanLikeMemorySystem:
         now = time.time()
         
         # 睡眠巩固：写入累计重要性达到阈值时执行
-        # （在降级检查之前——先抽象成要点，再让个体情景自然沉降）
+        # （在降级检查之前——先抽象成要点，再让个体情景自然沉降）。
+        # 自动触发只回放沉淀 ≥10 分钟的情景：正在进行的对话回合
+        # 不参与巩固——你不会把正在说的话拿去做梦。
         if self._importance_since_sleep >= self.sleep_threshold:
-            self.sleep()
+            self.sleep(min_replay_age=600.0)
 
         # 核心层降级检查
         to_degrade = self.core.check_degrade()

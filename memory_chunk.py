@@ -171,9 +171,15 @@ class MemoryChunk:
         激活计算回退到类型基线 d。返回是否真正记录（未被去抖）。
         """
         now = time.time()
+        # 去抖锚定在"上一次真正落账的使用事件"（access_log 尾），而不是
+        # last_accessed：后者每次被抑制的命中也会刷新，窗口无限前滑——
+        # 快节奏聊天（<60s/轮）会让热门记忆整场只记 1 次使用（对抗审查
+        # 实测 59s 节奏 30 次命中仅落账 1 次）。固定窗口：每 60 秒最多
+        # 落账一次，与"一分钟内的重复命中是同一次使用"的本意一致。
+        last_recorded = self.access_log[-1] if self.access_log else 0.0
         debounced = (
             self.access_count > 0
-            and now - self.last_accessed < self.ACCESS_DEBOUNCE_SECONDS
+            and now - last_recorded < self.ACCESS_DEBOUNCE_SECONDS
         )
         self.last_accessed = now
         self.updated_at = now
