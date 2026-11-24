@@ -518,6 +518,7 @@ class CognitiveAgent:
         auto_consolidate: bool = True,
         conversation_turns: int = 16,
         auto_extract: bool = True,
+        memory_manager: Optional[Any] = None,
     ):
         from core.conversation import ConversationBuffer
 
@@ -540,6 +541,9 @@ class CognitiveAgent:
         # 自动编码：每轮对话后从用户话语规则抽取事实进长期记忆
         # （走 add_memory 决策表 -> 取代链在聊天里真实生效）
         self.auto_extract = auto_extract
+        # 可选挂载学习型记忆管理器（如 MemoryR1Manager）：挂载后自动编码优先走
+        # Memory-R1 两阶段提取与 ADD/UPDATE/DELETE/NONE 仲裁，失败时无感回退规则引擎。
+        self.memory_manager = memory_manager
         self._extractor = None
         self._register_default_tools()
 
@@ -718,6 +722,15 @@ class CognitiveAgent:
         lowered = text.lower()
         if any(m in lowered for m in MEMORY_WRITE_NEGATIVE_MARKERS):
             return  # 用户明确拒绝记录——自动编码不得绕过否定意图
+
+        if self.memory_manager is not None and hasattr(self.memory_manager, "ingest_turn"):
+            try:
+                self.memory_manager.ingest_turn(text)
+                return
+            except Exception:
+                # 外部记忆模型不可达或返回坏格式时，降级回本地确定性规则抽取
+                pass
+
         if len(text) > self._AUTO_ENCODE_MAX_CHARS:
             return
         if any(m in lowered for m in self._NON_DECLARATIVE_MARKERS):

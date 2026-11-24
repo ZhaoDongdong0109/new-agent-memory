@@ -49,6 +49,7 @@ from core.mcp_client import (
     register_mcp_tools,
     sanitize_mcp_tool_name,
 )
+from core.memory_r1_manager import MemoryR1Manager, MemoryR1Op, MemoryR1TurnReport
 from core.weight_system import MemoryType
 
 __version__ = "0.2.0"
@@ -83,6 +84,9 @@ __all__ = [
     "MCPError",
     "MCPStdioClient",
     "MCPToolHub",
+    "MemoryR1Manager",
+    "MemoryR1Op",
+    "MemoryR1TurnReport",
     "OpenAICompatibleChatClient",
     "OpenAICompatibleConfig",
     "MemoryChunk",

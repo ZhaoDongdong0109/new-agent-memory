@@ -96,6 +96,21 @@ def _add_common_args(parser: argparse.ArgumentParser):
         default=None,
         help="Optional path to .mcp.json external MCP stdio server configuration.",
     )
+    parser.add_argument(
+        "--memory-r1",
+        action="store_true",
+        help="Attach MemoryR1Manager (two-stage RL-style fact extraction & ADD/UPDATE/DELETE/NONE controller).",
+    )
+    parser.add_argument(
+        "--memory-r1-url",
+        default=None,
+        help="Optional dedicated base URL (e.g. local vLLM/Ollama) for the Memory-R1 controller.",
+    )
+    parser.add_argument(
+        "--memory-r1-model",
+        default=None,
+        help="Optional dedicated model name (e.g. Qwen2.5-7B Memory-R1 checkpoint) for the Memory-R1 controller.",
+    )
 
     parser.add_argument("--api-key", default=None, help="Override OPENAI_API_KEY.")
     parser.add_argument("--base-url", default=None, help="Override OPENAI_BASE_URL, e.g. http://localhost:1234/v1.")
@@ -209,13 +224,25 @@ def _build_memory_and_runner(args: argparse.Namespace, stream_state: Optional[Di
             **_api_overrides(args),
         )
 
+    target_agent = getattr(runner, "agent", runner)
+    if getattr(args, "memory_r1", False):
+        r1_overrides = dict(_api_overrides(args))
+        r1_overrides["stream"] = False
+        if getattr(args, "memory_r1_url", None):
+            r1_overrides["base_url"] = args.memory_r1_url
+        if getattr(args, "memory_r1_model", None):
+            r1_overrides["model"] = args.memory_r1_model
+        target_agent.memory_manager = memory.create_memory_r1_manager(
+            env_file=args.env_file,
+            **r1_overrides,
+        )
+
     mcp_hub = None
     mcp_config_path = getattr(args, "mcp_config", None)
     if mcp_config_path:
         from core.mcp_client import MCPToolHub
 
         mcp_hub = MCPToolHub.from_config(mcp_config_path)
-        target_agent = getattr(runner, "agent", runner)
         mcp_hub.attach(target_agent)
         for srv_name, err in mcp_hub.errors.items():
             print(f"warning: MCP server '{srv_name}' unavailable: {err}", file=sys.stderr)

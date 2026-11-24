@@ -1034,6 +1034,23 @@ class HumanLikeMemorySystem:
         llm = getattr(agent.planner, "llm", None)
         finalizer = LLMRuntimeFinalizer(llm) if llm is not None else None
         return CognitiveRuntime(agent, config=CognitiveRuntimeConfig(max_steps=max_steps), finalizer=finalizer)
+
+    def create_memory_r1_manager(
+        self,
+        env_file: Optional[str] = ".env",
+        candidate_top_k: int = 5,
+        **api_overrides: Any,
+    ):
+        """创建对接当前记忆系统的 MemoryR1Manager（可指向 Memory-R1 vLLM 权重或任意兼容端点）。"""
+        from core.llm_planner import OpenAICompatibleConfig
+        from core.memory_r1_manager import MemoryR1Manager
+
+        cfg = OpenAICompatibleConfig.from_env(env_file=env_file, **api_overrides)
+        return MemoryR1Manager.from_openai_compatible(
+            memory_system=self,
+            api_config=cfg,
+            candidate_top_k=candidate_top_k,
+        )
     
     # ============ 维护 ============
     
