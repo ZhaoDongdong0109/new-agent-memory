@@ -14,8 +14,16 @@ from typing import Dict, List, Optional, Set, Tuple
 _PERSON_FALSE_POSITIVES = {
     "小时", "小心", "老是", "老家", "老板娘", "小说", "老虎", "小区",
     "小米", "小学", "小组", "小队", "小狗", "小猫", "小孩", "老板",
-    "老乡", "老天", "阿里", "老规", "小两",
+    "老乡", "老天", "阿里", "老规", "小两", "大家", "今天", "昨天",
 }
+
+# 常见中文单姓（用于正式姓名 + 强人称谓词的主语识别）
+_COMMON_SURNAMES = (
+    "张王李赵刘陈杨黄周吴徐孙胡朱高林何郭马罗梁宋郑谢韩唐冯于董萧"
+    "程曹袁邓许傅沈曾彭吕苏卢蒋蔡贾丁魏薛叶阎余潘杜戴夏钟汪田任姜"
+    "范方石姚谭廖邹熊金陆郝孔白崔康毛邱秦江史顾侯邵孟龙万段雷钱汤"
+    "尹黎易常武乔贺赖龚文"
+)
 
 
 class EntityExtractor:
@@ -116,6 +124,25 @@ class EntityExtractor:
         for name in re.findall(subject_pattern, text):
             if self._is_valid_name(name) and name not in _PERSON_FALSE_POSITIVES:
                 persons.add(name)
+
+        # 模式3：常见中文姓氏全名（2~3字）做主语 + 强人称谓词（张三住在… / 王明搬到…）
+        fullname_pattern = (
+            rf"(?:^|[，。；！？\s])([{_COMMON_SURNAMES}][一-鿿]{{1,2}})"
+            r"(?=(?:现在|最近|目前|今天|昨天|以前)?(?:说|住在?|搬到|搬去|定居|就职于|毕业于|娶|嫁|养了?))"
+        )
+        for name in re.findall(fullname_pattern, text):
+            if self._is_valid_name(name) and name not in _PERSON_FALSE_POSITIVES:
+                persons.add(name)
+
+        # 模式4：第一人称稳定画像事实（"我现在住在上海" / "我养了一只猫" / "我就职于…"）。
+        # 仅锚定持久身份/住址/偏好谓词，"我在调试模块"等暂态动作不入永久 FACT；
+        # 锚点直接记为 "我"，使后续改口走同一事实槽的取代链，且查询"我现在住在哪"能命中人物索引。
+        first_person_pattern = (
+            r"(?:^|[，。；！？\s])(我)"
+            r"(?=(?:现在|最近|目前|一直|以前|平时)?(?:住在?|搬到|搬去|定居|来自|老家在|叫|名字是|姓|养了?|就职于|毕业于|喜欢|偏好|讨厌|习惯))"
+        )
+        if re.search(first_person_pattern, text):
+            persons.add("我")
 
         return persons
 

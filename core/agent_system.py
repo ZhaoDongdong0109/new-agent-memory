@@ -241,8 +241,14 @@ class ExperienceEpisode:
 class ExperienceLayer:
     """Stores embodied episodes and consolidates them into memory."""
 
-    def __init__(self, episodes: Optional[List[ExperienceEpisode]] = None):
+    def __init__(
+        self,
+        episodes: Optional[List[ExperienceEpisode]] = None,
+        consolidation_engine: Optional[Any] = None,
+    ):
         self.episodes = episodes or []
+        self.consolidation_engine = consolidation_engine
+        self._entity_extractor = None
 
     def add(self, episode: ExperienceEpisode) -> str:
         self.episodes.append(episode)
@@ -250,6 +256,29 @@ class ExperienceLayer:
 
     def recent(self, limit: int = 10) -> List[ExperienceEpisode]:
         return self.episodes[-limit:]
+
+    def _extract_episode_anchors(self, episode: ExperienceEpisode) -> Dict[str, Any]:
+        """从原始用户任务抽取真实语义锚点，避免所有回合共享常量主题导致睡眠聚类退化。"""
+        if self._entity_extractor is None:
+            from core.entity_extractor import EntityExtractor
+
+            self._entity_extractor = EntityExtractor()
+        raw_task = str(
+            episode.observation.metadata.get("original_task") or episode.observation.content or ""
+        )
+        try:
+            entities = self._entity_extractor.extract_all(raw_task)
+        except Exception:
+            entities = {"topics": set(), "persons": set(), "keywords": set(), "location": None}
+        topics = list(entities.get("topics") or [])
+        if episode.action.name not in {"respond", "finish"} and episode.action.name not in topics:
+            topics.append(episode.action.name)
+        return {
+            "topics": topics or None,
+            "persons": list(entities.get("persons") or []) or None,
+            "keywords": list(entities.get("keywords") or [])[:8] or None,
+            "location": entities.get("location"),
+        }
 
     def consolidate(self, memory_system: Any, limit: int = 5) -> List[str]:
         """
@@ -268,20 +297,33 @@ class ExperienceLayer:
                 episode.consolidated_at = _now()
                 continue
 
-            if episode.observation.metadata.get("runtime"):
-                # runtime 脚手架观测只固化紧凑摘要，不存原始多 KB 上下文
-                content = episode.to_compact_memory_text()
+            if self.consolidation_engine is not None and hasattr(
+                self.consolidation_engine, "consolidate_episode"
+            ):
+                created.extend(self.consolidation_engine.consolidate_episode(episode))
             else:
-                content = episode.to_memory_text()
+                if episode.observation.metadata.get("runtime"):
+                    # runtime 脚手架观测只固化紧凑摘要，不存原始多 KB 上下文
+                    content = episode.to_compact_memory_text()
+                else:
+                    content = episode.to_memory_text()
 
-            memory_id = memory_system.add_memory(
-                content=content,
-                memory_type=MemoryType.STORY,
-                topics=["experience", "agent", episode.action.name],
-                importance=_clamp(0.35 + episode.reward * 0.45),
-                metadata={"experience_id": episode.id, "kind": "episode"},
-            )
-            created.append(memory_id)
+                anchors = self._extract_episode_anchors(episode)
+                memory_id = memory_system.add_memory(
+                    content=content,
+                    memory_type=MemoryType.STORY,
+                    topics=anchors["topics"],
+                    persons=anchors["persons"],
+                    keywords=anchors["keywords"],
+                    location=anchors["location"],
+                    importance=_clamp(0.35 + episode.reward * 0.45),
+                    metadata={
+                        "experience_id": episode.id,
+                        "kind": "episode",
+                        "action": episode.action.name,
+                    },
+                )
+                created.append(memory_id)
 
             if episode.result.success and episode.next_policy:
                 title = f"Learned policy: {episode.action.name}"
@@ -382,6 +424,23 @@ class ToolRegistry:
             described.append(entry)
         return described
 
+    def to_openai_tools(self) -> List[Dict[str, Any]]:
+        """转换为 OpenAI Chat Completions 原生 `tools` 数组格式。"""
+        openai_tools: List[Dict[str, Any]] = []
+        for tool in self.tools.values():
+            params = tool.parameters or {"type": "object", "properties": {}}
+            openai_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": params,
+                    },
+                }
+            )
+        return openai_tools
+
 
 Planner = Callable[[Observation, FocusWorkspace, ToolRegistry], AgentAction]
 Evaluator = Callable[[Observation, AgentAction, ActionResult], float]
@@ -470,8 +529,14 @@ class CognitiveAgent:
         self.experience = experience_layer or ExperienceLayer()
         self.tools = ToolRegistry()
         self.auto_consolidate = auto_consolidate
-        # 会话工作记忆：多轮对话的连续性（溢出轮归档进长期记忆）
-        self.conversation = ConversationBuffer(max_turns=conversation_turns)
+        # 会话工作记忆：多轮对话的连续性（溢出轮归档进长期记忆）。
+        # 若底层 memory_system 已持有持久化会话缓冲则共享，使跨进程会话恢复自然生效。
+        shared_conv = getattr(memory_system, "conversation", None)
+        if isinstance(shared_conv, ConversationBuffer):
+            shared_conv.max_turns = conversation_turns
+            self.conversation = shared_conv
+        else:
+            self.conversation = ConversationBuffer(max_turns=conversation_turns)
         # 自动编码：每轮对话后从用户话语规则抽取事实进长期记忆
         # （走 add_memory 决策表 -> 取代链在聊天里真实生效）
         self.auto_extract = auto_extract
@@ -498,6 +563,7 @@ class CognitiveAgent:
         # 不得压过真实缓冲。
         if self.conversation.turns:
             observation.metadata["conversation"] = self.conversation.render_context()
+            observation.metadata["conversation_messages"] = self.conversation.to_messages()
         self.conversation.add("user", observation.content)
 
         workspace = self.build_workspace(observation)
@@ -513,6 +579,7 @@ class CognitiveAgent:
         # 历史块只服务于本轮提示；留在 metadata 里会随 episode
         # 持久化，30 轮聊天累计重复存储 50KB+（对抗审查实测）
         observation.metadata.pop("conversation", None)
+        observation.metadata.pop("conversation_messages", None)
         return episode
 
     def build_workspace(self, observation: Observation) -> FocusWorkspace:
@@ -760,6 +827,7 @@ class CognitiveAgent:
             "name": self.name,
             "auto_consolidate": self.auto_consolidate,
             "experience": self.experience.to_dict(),
+            "conversation": self.conversation.to_dict(),
             "tools": self.tools.describe(),
         }
 
@@ -771,7 +839,7 @@ class CognitiveAgent:
         planner: Planner = default_planner,
         evaluator: Evaluator = default_evaluator,
     ) -> "CognitiveAgent":
-        return cls(
+        agent = cls(
             memory_system=memory_system,
             name=data.get("name", "cognitive-agent"),
             planner=planner,
@@ -779,6 +847,10 @@ class CognitiveAgent:
             experience_layer=ExperienceLayer.from_dict(data.get("experience", {})),
             auto_consolidate=bool(data.get("auto_consolidate", True)),
         )
+        conv_data = data.get("conversation")
+        if isinstance(conv_data, dict):
+            agent.conversation.load_from_dict(conv_data)
+        return agent
 
     def _synthesize_result(
         self,

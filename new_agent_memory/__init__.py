@@ -39,6 +39,16 @@ from core.cognitive_state import (
     WorldBelief,
     WorldEntity,
 )
+from core.conversation import ConversationBuffer, ConversationTurn
+from core.mcp_client import (
+    MCPError,
+    MCPStdioClient,
+    MCPToolHub,
+    load_mcp_config,
+    mcp_result_to_action_result,
+    register_mcp_tools,
+    sanitize_mcp_tool_name,
+)
 from core.weight_system import MemoryType
 
 __version__ = "0.2.0"
@@ -56,6 +66,8 @@ __all__ = [
     "CognitiveRuntimeConfig",
     "CognitiveStep",
     "CognitiveState",
+    "ConversationBuffer",
+    "ConversationTurn",
     "DriveState",
     "ExperienceEpisode",
     "ExperienceLayer",
@@ -68,6 +80,9 @@ __all__ = [
     "LLMRuntimeFinalizer",
     "LLMResponseSynthesizer",
     "LLMResponseSynthesizerConfig",
+    "MCPError",
+    "MCPStdioClient",
+    "MCPToolHub",
     "OpenAICompatibleChatClient",
     "OpenAICompatibleConfig",
     "MemoryChunk",
@@ -81,5 +96,9 @@ __all__ = [
     "WorldBelief",
     "WorldEntity",
     "load_env_file",
+    "load_mcp_config",
+    "mcp_result_to_action_result",
+    "register_mcp_tools",
+    "sanitize_mcp_tool_name",
     "__version__",
 ]

@@ -79,10 +79,11 @@ OPENAI_MODEL=hermes-3
 new-agent-memory ask "你现在是谁？用一句话说明你能做什么。"
 ```
 
-交互式会话：
+交互式会话（支持原生函数调用、SSE 流式输出与外部 MCP 工具配置）：
 
 ```bash
 new-agent-memory chat --goal "帮助用户把记忆系统进化成可下载可运行的智能体"
+new-agent-memory chat --native-tools --stream --mcp-config .mcp.json
 ```
 
 Python 中直接创建：
@@ -138,6 +139,8 @@ OPENAI_MODEL
 OPENAI_TEMPERATURE
 OPENAI_MAX_TOKENS
 OPENAI_TIMEOUT
+OPENAI_STREAM
+OPENAI_NATIVE_TOOLS
 OPENAI_USE_ENV_PROXY
 ```
 
@@ -648,8 +651,8 @@ python -m compileall .
 - [ ] 睡眠周期第二切片：当前值槽索引 + 槽内乱序矛盾重扫 + MCP 维护工具
 - [x] 要点支持计数：后续匹配情景增强既有要点而非重复抽象（图式强化：support_count + 重要性随支持情景总数增长）
 - [x] 大脑主循环 v1：多轮会话工作记忆（溢出归档）+ 生产检索接入 agent 召回（ACT-R/间隔效应在对话里生效）+ 聊天自动编码（改口走取代链）+ 工具参数 Schema + 聊天内睡眠可达
-- [ ] 大脑主循环 v2：原生 tool-calling 消息协议 + 流式输出 + runtime 多步路径接入会话缓冲/自动编码 + MCP 客户端（消费外部工具）
-- [ ] 经验复盘 `ConsolidationEngine` 接入 Agent 主循环
+- [x] 大脑主循环 v2：原生 tool-calling 消息协议 + 流式输出 + runtime 多步路径接入会话缓冲/自动编码 + MCP 客户端（消费外部工具） + 第一人称事实自动编码 + 会话持久化 + 回合固化聚类去退化
+- [x] 经验复盘 `ConsolidationEngine` 可选接入 Agent `ExperienceLayer`
 - [ ] LLM 驱动的碎片组装与审阅（可选插件）
 
 ## Positioning

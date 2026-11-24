@@ -79,6 +79,23 @@ def _add_common_args(parser: argparse.ArgumentParser):
     parser.add_argument("--show-summary", action="store_true", help="Print cognitive summary after the turn.")
     parser.add_argument("--runtime", action="store_true", help="Use the multi-step CognitiveRuntime loop.")
     parser.add_argument("--max-steps", type=int, default=4, help="Maximum CognitiveRuntime steps.")
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        default=None,
+        help="Stream tokens from OpenAI-compatible endpoints in real time.",
+    )
+    parser.add_argument(
+        "--native-tools",
+        action="store_true",
+        default=None,
+        help="Use OpenAI-compatible native tools / tool_calls message protocol.",
+    )
+    parser.add_argument(
+        "--mcp-config",
+        default=None,
+        help="Optional path to .mcp.json external MCP stdio server configuration.",
+    )
 
     parser.add_argument("--api-key", default=None, help="Override OPENAI_API_KEY.")
     parser.add_argument("--base-url", default=None, help="Override OPENAI_BASE_URL, e.g. http://localhost:1234/v1.")
@@ -89,86 +106,121 @@ def _add_common_args(parser: argparse.ArgumentParser):
 
 
 def run_ask(args: argparse.Namespace) -> int:
-    memory, runner = _build_memory_and_runner(args)
-    if args.runtime:
-        run = runner.run(args.message)
-        _print_run(run, args, memory)
-        ok = run.result.success
-    else:
-        episode = runner.run_turn(args.message)
-        _print_episode(episode, args, memory)
-        ok = episode.result.success
-    _save_if_needed(memory, args)
-    return 0 if ok else 1
+    stream_state = {"emitted": False}
+    memory, runner, mcp_hub = _build_memory_and_runner(args, stream_state=stream_state)
+    try:
+        if args.runtime:
+            run = runner.run(args.message)
+            _print_run(run, args, memory, stream_state=stream_state)
+            ok = run.result.success
+        else:
+            episode = runner.run_turn(args.message)
+            _print_episode(episode, args, memory, stream_state=stream_state)
+            ok = episode.result.success
+        _save_if_needed(memory, args)
+        return 0 if ok else 1
+    finally:
+        if mcp_hub is not None:
+            mcp_hub.close()
 
 
 def run_chat(args: argparse.Namespace) -> int:
-    memory, runner = _build_memory_and_runner(args)
+    stream_state = {"emitted": False}
+    memory, runner, mcp_hub = _build_memory_and_runner(args, stream_state=stream_state)
     print("new-agent-memory chat. Type :quit to exit, :save to persist, :summary to inspect state.")
 
-    while True:
-        try:
-            message = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-
-        if not message:
-            continue
-        command = message.lower()
-        if command in {":q", ":quit", ":exit", "q", "quit", "exit"}:
-            break
-        if command == ":save":
-            memory.save()
-            print("saved")
-            continue
-        if command == ":summary":
-            print(json.dumps(memory.get_cognitive_summary(), ensure_ascii=False, indent=2))
-            continue
-
-        if args.runtime:
-            run = runner.run(message)
-            _print_run(run, args, memory)
-        else:
-            episode = runner.run_turn(message)
-            _print_episode(episode, args, memory)
-
-        # 每轮后维护：走 6 小时限速的 auto_maintain_if_needed，
-        # 睡眠巩固/衰减降级在长聊里真实可达。不能每轮裸调
-        # maintain()：decay_all_unused 每次调用都无条件扣减闲置
-        # 记忆的访问计数，会把"按时间衰减"变成"按聊天轮数衰减"
-        # （对抗审查实测 5 轮聊掉 5 次访问计数）。
-        if hasattr(memory, "auto_maintain_if_needed"):
+    try:
+        while True:
             try:
-                memory.auto_maintain_if_needed()
-            except Exception as exc:  # 维护失败不打断对话
-                print(f"[maintain skipped: {exc}]")
+                message = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
 
-    _save_if_needed(memory, args)
-    return 0
+            if not message:
+                continue
+            command = message.lower()
+            if command in {":q", ":quit", ":exit", "q", "quit", "exit"}:
+                break
+            if command == ":save":
+                memory.save()
+                print("saved")
+                continue
+            if command == ":summary":
+                print(json.dumps(memory.get_cognitive_summary(), ensure_ascii=False, indent=2))
+                continue
+
+            stream_state["emitted"] = False
+            if args.runtime:
+                run = runner.run(message)
+                _print_run(run, args, memory, stream_state=stream_state)
+            else:
+                episode = runner.run_turn(message)
+                _print_episode(episode, args, memory, stream_state=stream_state)
+
+            # 每轮后维护：走 6 小时限速的 auto_maintain_if_needed，
+            # 睡眠巩固/衰减降级在长聊里真实可达。不能每轮裸调
+            # maintain()：decay_all_unused 每次调用都无条件扣减闲置
+            # 记忆的访问计数，会把"按时间衰减"变成"按聊天轮数衰减"
+            # （对抗审查实测 5 轮聊掉 5 次访问计数）。
+            if hasattr(memory, "auto_maintain_if_needed"):
+                try:
+                    memory.auto_maintain_if_needed()
+                except Exception as exc:  # 维护失败不打断对话
+                    print(f"[maintain skipped: {exc}]")
+
+        _save_if_needed(memory, args)
+        return 0
+    finally:
+        if mcp_hub is not None:
+            mcp_hub.close()
 
 
-def _build_memory_and_runner(args: argparse.Namespace):
+def _build_memory_and_runner(args: argparse.Namespace, stream_state: Optional[Dict[str, bool]] = None):
     memory = HumanLikeMemorySystem(data_dir=args.data_dir)
     if not args.fresh:
         memory.load()
     if args.goal:
         memory.start_goal(args.goal)
 
+    extra_kwargs: Dict[str, Any] = {}
+    if getattr(args, "stream", None):
+        def _on_token(piece: str) -> None:
+            if stream_state is not None:
+                stream_state["emitted"] = True
+            sys.stdout.write(piece)
+            sys.stdout.flush()
+
+        extra_kwargs["on_token"] = _on_token
+
     if args.runtime:
         runner = memory.create_openai_runtime(
             name=args.name,
             env_file=args.env_file,
             max_steps=args.max_steps,
+            **extra_kwargs,
             **_api_overrides(args),
         )
     else:
         runner = memory.create_openai_agent(
             name=args.name,
             env_file=args.env_file,
+            **extra_kwargs,
             **_api_overrides(args),
         )
-    return memory, runner
+
+    mcp_hub = None
+    mcp_config_path = getattr(args, "mcp_config", None)
+    if mcp_config_path:
+        from core.mcp_client import MCPToolHub
+
+        mcp_hub = MCPToolHub.from_config(mcp_config_path)
+        target_agent = getattr(runner, "agent", runner)
+        mcp_hub.attach(target_agent)
+        for srv_name, err in mcp_hub.errors.items():
+            print(f"warning: MCP server '{srv_name}' unavailable: {err}", file=sys.stderr)
+
+    return memory, runner, mcp_hub
 
 
 def _api_overrides(args: argparse.Namespace) -> Dict[str, Any]:
@@ -179,11 +231,20 @@ def _api_overrides(args: argparse.Namespace) -> Dict[str, Any]:
         "temperature": args.temperature,
         "timeout": args.timeout,
         "max_tokens": args.max_tokens,
+        "stream": getattr(args, "stream", None),
+        "native_tools": getattr(args, "native_tools", None),
     }
 
 
-def _print_episode(episode: Any, args: argparse.Namespace, memory: HumanLikeMemorySystem):
-    if episode.result.output:
+def _print_episode(
+    episode: Any,
+    args: argparse.Namespace,
+    memory: HumanLikeMemorySystem,
+    stream_state: Optional[Dict[str, bool]] = None,
+):
+    if stream_state and stream_state.get("emitted"):
+        print()
+    elif episode.result.output:
         print(episode.result.output)
     if args.show_action:
         print(
@@ -202,8 +263,15 @@ def _print_episode(episode: Any, args: argparse.Namespace, memory: HumanLikeMemo
         print(json.dumps(memory.get_cognitive_summary(), ensure_ascii=False, indent=2))
 
 
-def _print_run(run: Any, args: argparse.Namespace, memory: HumanLikeMemorySystem):
-    if run.result.output:
+def _print_run(
+    run: Any,
+    args: argparse.Namespace,
+    memory: HumanLikeMemorySystem,
+    stream_state: Optional[Dict[str, bool]] = None,
+):
+    if stream_state and stream_state.get("emitted"):
+        print()
+    elif run.result.output:
         print(run.result.output)
     if args.show_action:
         print(

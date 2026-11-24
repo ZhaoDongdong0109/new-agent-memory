@@ -7,7 +7,7 @@ and returns text. The returned text should contain a JSON action.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 import json
 import os
 import re
@@ -83,6 +83,7 @@ class OpenAICompatibleConfig:
     temperature: float = 0.1
     max_tokens: Optional[int] = 800
     stream: bool = False
+    native_tools: bool = False
     use_env_proxy: bool = False
     extra_headers: Dict[str, str] = field(default_factory=dict)
     extra_body: Dict[str, Any] = field(default_factory=dict)
@@ -126,6 +127,10 @@ class OpenAICompatibleConfig:
             )
             or cls.max_tokens,
             stream=_parse_bool(merged.get("OPENAI_COMPATIBLE_STREAM") or merged.get("OPENAI_STREAM"), cls.stream),
+            native_tools=_parse_bool(
+                merged.get("OPENAI_COMPATIBLE_NATIVE_TOOLS") or merged.get("OPENAI_NATIVE_TOOLS"),
+                cls.native_tools,
+            ),
             use_env_proxy=_parse_bool(
                 merged.get("OPENAI_COMPATIBLE_USE_ENV_PROXY") or merged.get("OPENAI_USE_ENV_PROXY"),
                 cls.use_env_proxy,
@@ -139,10 +144,19 @@ class OpenAICompatibleConfig:
 
 
 class OpenAICompatibleChatClient:
-    """Tiny stdlib client for /v1/chat/completions compatible APIs."""
+    """Tiny stdlib client for /v1/chat/completions compatible APIs.
 
-    def __init__(self, config: Optional[OpenAICompatibleConfig] = None):
+    大脑主循环 v2：同时支持标准单次 JSON 响应、SSE 流式输出（`data: ...`），
+    以及原生多消息 + `tools` 函数调用协议（`complete_messages`）。
+    """
+
+    def __init__(
+        self,
+        config: Optional[OpenAICompatibleConfig] = None,
+        on_token: Optional[Callable[[str], None]] = None,
+    ):
         self.config = config or OpenAICompatibleConfig.from_env()
+        self.on_token = on_token
         self.last_request: Dict[str, Any] = {}
         self.last_response: Dict[str, Any] = {}
 
@@ -150,31 +164,88 @@ class OpenAICompatibleChatClient:
         return self.complete(
             prompt,
             system_prompt="Return only the JSON action requested by the user prompt.",
+            emit_tokens=False,
         )
 
-    def complete(self, prompt: str, system_prompt: Optional[str] = None) -> str:
-        if self.config.stream:
-            raise RuntimeError("Streaming responses are not supported yet; set OPENAI_STREAM=false.")
-
-        messages = []
+    def complete(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        stream: Optional[bool] = None,
+        on_token: Optional[Callable[[str], None]] = None,
+        emit_tokens: bool = True,
+    ) -> str:
+        messages: List[Dict[str, Any]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
-        payload = {
+        use_stream = self.config.stream if stream is None else bool(stream)
+        token_cb = (on_token or self.on_token) if emit_tokens else on_token
+
+        payload: Dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
             "temperature": self.config.temperature,
-            "stream": self.config.stream,
+            "stream": use_stream,
         }
         if self.config.max_tokens is not None:
             payload["max_tokens"] = self.config.max_tokens
         payload.update(self.config.extra_body)
 
+        data = self._send_chat_request(payload, use_stream=use_stream, token_cb=token_cb)
+        self.last_response = data
+        return self._extract_text(data)
+
+    def complete_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = "auto",
+        stream: Optional[bool] = None,
+        on_token: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
+        """发送多轮原生消息数组及可选 `tools` 定义，返回 assistant message 字典。"""
+        use_stream = self.config.stream if stream is None else bool(stream)
+        token_cb = on_token or self.on_token
+
+        payload: Dict[str, Any] = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature,
+            "stream": use_stream,
+        }
+        if self.config.max_tokens is not None:
+            payload["max_tokens"] = self.config.max_tokens
+        if tools:
+            payload["tools"] = tools
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
+        payload.update(self.config.extra_body)
+
+        data = self._send_chat_request(payload, use_stream=use_stream, token_cb=token_cb)
+        self.last_response = data
+        choices = data.get("choices") or []
+        if choices and isinstance(choices[0], Mapping):
+            msg = choices[0].get("message")
+            if isinstance(msg, dict):
+                return msg
+        if "output_text" in data:
+            return {"role": "assistant", "content": str(data["output_text"])}
+        raise LLMError("OpenAI-compatible API response did not include an assistant message.")
+
+    def _send_chat_request(
+        self,
+        payload: Dict[str, Any],
+        use_stream: bool,
+        token_cb: Optional[Callable[[str], None]],
+    ) -> Dict[str, Any]:
         headers = {
             "Content-Type": "application/json",
             **self.config.extra_headers,
         }
+        if use_stream:
+            headers.setdefault("Accept", "text/event-stream")
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
 
@@ -195,6 +266,8 @@ class OpenAICompatibleChatClient:
 
         try:
             with opener.open(request, timeout=self.config.timeout) as response:
+                if use_stream:
+                    return self._consume_sse_stream(response, token_cb=token_cb)
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
@@ -205,11 +278,138 @@ class OpenAICompatibleChatClient:
             raise LLMError(f"OpenAI-compatible API connection failed: {exc}") from exc
 
         try:
-            data = json.loads(raw)
+            return json.loads(raw)
         except json.JSONDecodeError as exc:
             raise LLMError(f"OpenAI-compatible API returned invalid JSON: {raw[:500]}") from exc
-        self.last_response = data
-        return self._extract_text(data)
+
+    def _consume_sse_stream(
+        self,
+        response: Any,
+        token_cb: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
+        """解析 OpenAI 兼容 SSE 流，聚合成标准非流式响应结构（含 tool_calls 增量拼接）。"""
+        content_parts: List[str] = []
+        tool_calls_by_index: Dict[int, Dict[str, Any]] = {}
+        finish_reason: Optional[str] = None
+        stream_id = ""
+        stream_model = self.config.model
+        saw_sse_data = False
+        raw_fallback_lines: List[str] = []
+
+        for raw_line in response:
+            decoded = raw_line.decode("utf-8", errors="replace")
+            raw_fallback_lines.append(decoded)
+            line = decoded.strip()
+            if not line or line.startswith(":"):
+                continue
+            if not line.startswith("data:"):
+                continue
+
+            saw_sse_data = True
+            data_str = line[5:].strip()
+            if not data_str:
+                continue
+            if data_str == "[DONE]":
+                break
+
+            try:
+                chunk = json.loads(data_str)
+            except json.JSONDecodeError as exc:
+                raise LLMError(f"OpenAI-compatible SSE chunk invalid JSON: {data_str[:300]}") from exc
+
+            if not isinstance(chunk, Mapping):
+                continue
+            if chunk.get("id"):
+                stream_id = str(chunk["id"])
+            if chunk.get("model"):
+                stream_model = str(chunk["model"])
+
+            choices = chunk.get("choices") or []
+            if not choices or not isinstance(choices[0], Mapping):
+                continue
+            choice = choices[0]
+            if choice.get("finish_reason"):
+                finish_reason = str(choice["finish_reason"])
+
+            delta = choice.get("delta") or choice.get("message") or {}
+            if not isinstance(delta, Mapping):
+                continue
+
+            piece = delta.get("content")
+            if isinstance(piece, str) and piece:
+                content_parts.append(piece)
+                if token_cb is not None:
+                    token_cb(piece)
+            elif isinstance(piece, list):
+                text_piece = "".join(
+                    item.get("text", "") if isinstance(item, Mapping) else str(item)
+                    for item in piece
+                )
+                if text_piece:
+                    content_parts.append(text_piece)
+                    if token_cb is not None:
+                        token_cb(text_piece)
+
+            raw_tcs = delta.get("tool_calls")
+            if isinstance(raw_tcs, list):
+                for pos, tc in enumerate(raw_tcs):
+                    if not isinstance(tc, Mapping):
+                        continue
+                    idx = int(tc.get("index", pos))
+                    acc = tool_calls_by_index.setdefault(
+                        idx,
+                        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                    )
+                    if tc.get("id"):
+                        acc["id"] = str(tc["id"])
+                    if tc.get("type"):
+                        acc["type"] = str(tc["type"])
+                    fn = tc.get("function")
+                    if isinstance(fn, Mapping):
+                        if fn.get("name"):
+                            acc["function"]["name"] += str(fn["name"])
+                        if fn.get("arguments"):
+                            acc["function"]["arguments"] += str(fn["arguments"])
+
+        if not saw_sse_data:
+            # 兼容忽略 stream=true 直接返回整包 JSON 的服务端
+            joined = "".join(raw_fallback_lines).strip()
+            if joined:
+                try:
+                    data = json.loads(joined)
+                    if token_cb is not None:
+                        try:
+                            text = self._extract_text(data)
+                            if text:
+                                token_cb(text)
+                        except LLMError:
+                            pass
+                    return data
+                except json.JSONDecodeError as exc:
+                    raise LLMError(f"OpenAI-compatible stream returned non-SSE payload: {joined[:300]}") from exc
+            raise LLMError("OpenAI-compatible stream ended with empty response.")
+
+        message_obj: Dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(content_parts),
+        }
+        if tool_calls_by_index:
+            message_obj["tool_calls"] = [
+                tool_calls_by_index[idx] for idx in sorted(tool_calls_by_index)
+            ]
+
+        return {
+            "id": stream_id,
+            "model": stream_model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message_obj,
+                    "finish_reason": finish_reason or ("tool_calls" if tool_calls_by_index else "stop"),
+                }
+            ],
+            "streamed": True,
+        }
 
     def _extract_text(self, data: Dict[str, Any]) -> str:
         choices = data.get("choices") or []
@@ -241,6 +441,8 @@ class LLMPlannerConfig:
     max_prompt_chars: int = 12000
     json_repair_attempts: int = 1
     direct_response_fallback: bool = True
+    # None 表示跟随底层 client.config.native_tools；显式布尔值可强开/强关原生函数调用
+    native_tools: Optional[bool] = None
 
 
 @dataclass
@@ -488,8 +690,22 @@ class LLMPlanner:
         self.config = config or LLMPlannerConfig()
         self.last_prompt: str = ""
         self.last_output: str = ""
+        self.last_messages: List[Dict[str, Any]] = []
+
+    def _use_native_tools(self) -> bool:
+        if not callable(getattr(self.llm, "complete_messages", None)):
+            return False
+        if self.config.native_tools is not None:
+            return bool(self.config.native_tools)
+        client_cfg = getattr(self.llm, "config", None)
+        return bool(getattr(client_cfg, "native_tools", False))
 
     def __call__(self, observation: Observation, workspace: FocusWorkspace, tools: ToolRegistry) -> AgentAction:
+        if self._use_native_tools():
+            native_action = self._plan_with_native_tools(observation, workspace, tools)
+            if native_action is not None:
+                return native_action
+
         prompt = self.build_prompt(observation, workspace, tools)
         original_prompt = prompt
         self.last_prompt = prompt
@@ -501,6 +717,7 @@ class LLMPlanner:
                 output = self._call_llm(
                     prompt,
                     system_prompt="Return only the JSON action requested by the user prompt.",
+                    emit_tokens=False,
                 )
             except LLMError as exc:
                 # 传输层失败：不再抛出中断整个回合，降级并把错误写入动作 metadata
@@ -520,6 +737,161 @@ class LLMPlanner:
 
         return self.parse_action(output, tools)
 
+    def build_messages(self, observation: Observation, workspace: FocusWorkspace) -> List[Dict[str, Any]]:
+        """构建原生多消息协议数组：system（记忆工作区+守则）+ 会话历史 + 当前用户消息。"""
+        focus_context = workspace.to_prompt_context()
+        audit = json.dumps(workspace.audit[:6], ensure_ascii=False)
+        metadata = dict(observation.metadata or {})
+        raw_history = metadata.pop("conversation_messages", None)
+        conversation_text = str(metadata.pop("conversation", "") or "")
+
+        system_body = f"""
+{self.config.system_instructions}
+
+Current focus workspace:
+{focus_context or "(empty)"}
+
+Attention audit sample:
+{audit}
+
+Rules:
+- The latest user message is the active task; prior memory and open questions are supporting evidence only.
+- Call a tool when an external action, introspection, explicit memory storage, or runtime `finish` is needed.
+- If no external tool is needed, you may either answer the user directly in natural language or call `respond`.
+- Call `remember` ONLY when the user explicitly asks to remember/save/store/record information, and NEVER when negated.
+""".strip()
+
+        budget = max(self.config.max_prompt_chars, 800)
+        if len(system_body) > budget // 2:
+            system_body = system_body[: budget // 2] + "\n...[workspace truncated]"
+
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": system_body}]
+
+        history_msgs: List[Dict[str, str]] = []
+        if isinstance(raw_history, list):
+            for item in raw_history:
+                if isinstance(item, Mapping) and item.get("role") in {"user", "assistant"} and item.get("content"):
+                    history_msgs.append({"role": str(item["role"]), "content": str(item["content"])})
+        elif conversation_text:
+            for line in conversation_text.splitlines():
+                if line.startswith("用户: "):
+                    history_msgs.append({"role": "user", "content": line[4:]})
+                elif line.startswith("助手: "):
+                    history_msgs.append({"role": "assistant", "content": line[4:]})
+
+        # 预算裁剪历史：优先保留最近轮次
+        kept_history: List[Dict[str, str]] = []
+        used = len(system_body) + len(observation.content)
+        for msg in reversed(history_msgs):
+            cost = len(msg["content"]) + 16
+            if used + cost > budget and kept_history:
+                break
+            kept_history.append(msg)
+            used += cost
+        messages.extend(reversed(kept_history))
+
+        user_content = observation.content
+        if metadata and not metadata.get("runtime"):
+            user_content = f"{observation.content}\n\n[metadata: {json.dumps(metadata, ensure_ascii=False)}]"
+        messages.append({"role": "user", "content": user_content})
+        return messages
+
+    def _plan_with_native_tools(
+        self,
+        observation: Observation,
+        workspace: FocusWorkspace,
+        tools: ToolRegistry,
+    ) -> Optional[AgentAction]:
+        """走原生 `tools` / `tool_calls` 协议；若服务端不支持 tools 参数则回退提示 JSON。"""
+        messages = self.build_messages(observation, workspace)
+        self.last_messages = messages
+        self.last_prompt = json.dumps(messages, ensure_ascii=False)
+        openai_tools = tools.to_openai_tools() if hasattr(tools, "to_openai_tools") else []
+
+        try:
+            msg = self.llm.complete_messages(messages, tools=openai_tools, tool_choice="auto")
+        except LLMError as exc:
+            err_lower = str(exc).lower()
+            # 部分本地网关不支持 tools 字段（返回 400/422），透明回退到提示 JSON 路径
+            if any(code in err_lower for code in ("http 400", "http 422", "http 501")) and any(
+                kw in err_lower for kw in ("tool", "function")
+            ):
+                return None
+            return self._degraded_action_for_llm_error(observation, workspace, tools, exc)
+
+        raw_content = msg.get("content") or ""
+        if isinstance(raw_content, list):
+            raw_content = "".join(
+                item.get("text", "") if isinstance(item, Mapping) else str(item)
+                for item in raw_content
+            )
+        content_str = str(raw_content).strip()
+        self.last_output = content_str
+
+        tool_calls = msg.get("tool_calls") or []
+        if isinstance(tool_calls, list) and tool_calls:
+            tc = tool_calls[0] if isinstance(tool_calls[0], Mapping) else {}
+            fn = tc.get("function") if isinstance(tc.get("function"), Mapping) else {}
+            raw_name = str(fn.get("name") or "")
+            raw_args = fn.get("arguments", {})
+            self.last_output = json.dumps({"tool_call": dict(tc)}, ensure_ascii=False)
+
+            if isinstance(raw_args, str):
+                raw_args_str = raw_args.strip()
+                if not raw_args_str:
+                    parsed_args: Dict[str, Any] = {}
+                else:
+                    try:
+                        loaded = json.loads(raw_args_str)
+                        parsed_args = loaded if isinstance(loaded, dict) else {"input": loaded}
+                    except json.JSONDecodeError:
+                        return None
+            elif isinstance(raw_args, Mapping):
+                parsed_args = dict(raw_args)
+            else:
+                parsed_args = {}
+
+            resolved_name = raw_name if raw_name in tools.tools else self._resolve_tool_name(raw_name, tools)
+            if resolved_name is None:
+                fallback = self._fallback_action(f"Planner selected unavailable tool '{raw_name}'.")
+                heuristic = self._heuristic_fallback_action(observation, tools, fallback)
+                if heuristic is not fallback:
+                    return heuristic
+                return self._direct_response_fallback_action(observation, workspace, self.last_output)
+
+            action = AgentAction(
+                name=resolved_name,
+                arguments=parsed_args,
+                rationale=content_str or "native_tool_call",
+                metadata={
+                    "protocol": "native_tools",
+                    "tool_call_id": str(tc.get("id") or ""),
+                },
+            )
+            return self._guard_action(action, observation, workspace, tools, self.last_output)
+
+        if content_str:
+            # 兼容在原生模式下仍往 content 输出 JSON 动作的模型
+            if content_str.startswith("{") or content_str.startswith("```"):
+                parsed = self.parse_action(content_str, tools)
+                if not self._is_parse_fallback(parsed):
+                    parsed.metadata.setdefault("protocol", "native_tools_json_content")
+                    return self._guard_action(parsed, observation, workspace, tools, content_str)
+
+            direct_action = AgentAction(
+                name=self.config.default_action,
+                arguments={"message": content_str},
+                rationale="native_direct_reply",
+                metadata={"protocol": "native_tools"},
+            )
+            return self._guard_action(direct_action, observation, workspace, tools, content_str)
+
+        fallback = self._fallback_action("Empty native response from model.")
+        heuristic = self._heuristic_fallback_action(observation, tools, fallback)
+        if heuristic is not fallback:
+            return heuristic
+        return self._direct_response_fallback_action(observation, workspace, "")
+
     def build_prompt(self, observation: Observation, workspace: FocusWorkspace, tools: ToolRegistry) -> str:
         tool_descriptions = json.dumps(tools.describe(), ensure_ascii=False, indent=2)
         focus_context = workspace.to_prompt_context()
@@ -528,6 +900,7 @@ class LLMPlanner:
         # 多轮对话历史独立成块（来自会话工作记忆），不混进 metadata
         metadata = dict(observation.metadata or {})
         conversation = str(metadata.pop("conversation", "") or "")
+        metadata.pop("conversation_messages", None)
         conversation_block = (
             f"\nRecent conversation (older first):\n{conversation}\n" if conversation else ""
         )
@@ -812,10 +1185,18 @@ Previous invalid output:
             action.metadata["llm_error"] = llm_error
         return action
 
-    def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+    def _call_llm(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        emit_tokens: bool = True,
+    ) -> str:
         complete = getattr(self.llm, "complete", None)
         if callable(complete):
-            return complete(prompt, system_prompt=system_prompt)
+            try:
+                return complete(prompt, system_prompt=system_prompt, emit_tokens=emit_tokens)
+            except TypeError:
+                return complete(prompt, system_prompt=system_prompt)
         return self.llm(prompt)
 
     def build_direct_response_prompt(
@@ -912,6 +1293,7 @@ Previous invalid output:
         cls,
         api_config: Optional[OpenAICompatibleConfig] = None,
         planner_config: Optional[LLMPlannerConfig] = None,
+        on_token: Optional[Callable[[str], None]] = None,
         **api_overrides: Any,
     ) -> "LLMPlanner":
         """Build a planner from a /v1/chat/completions compatible endpoint."""
@@ -922,15 +1304,20 @@ Previous invalid output:
                 api_config,
                 **{key: value for key, value in api_overrides.items() if value is not None},
             )
-        return cls(llm=OpenAICompatibleChatClient(api_config), config=planner_config)
+        return cls(llm=OpenAICompatibleChatClient(api_config, on_token=on_token), config=planner_config)
 
     @classmethod
     def from_openai_compatible_env(
         cls,
         env_file: Optional[str] = ".env",
         planner_config: Optional[LLMPlannerConfig] = None,
+        on_token: Optional[Callable[[str], None]] = None,
         **api_overrides: Any,
     ) -> "LLMPlanner":
         """Build a planner from environment variables and an optional .env file."""
         api_config = OpenAICompatibleConfig.from_env(env_file=env_file, **api_overrides)
-        return cls.from_openai_compatible(api_config=api_config, planner_config=planner_config)
+        return cls.from_openai_compatible(
+            api_config=api_config,
+            planner_config=planner_config,
+            on_token=on_token,
+        )

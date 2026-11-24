@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Any, Dict, List, Mapping
 
 
 @dataclass
@@ -24,8 +24,16 @@ class ConversationTurn:
     content: str
     timestamp: float = field(default_factory=lambda: time.time())
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> Dict[str, Any]:
         return {"role": self.role, "content": self.content, "timestamp": self.timestamp}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ConversationTurn":
+        return cls(
+            role=str(data.get("role", "user")),
+            content=str(data.get("content", "")),
+            timestamp=float(data.get("timestamp", time.time())),
+        )
 
 
 class ConversationBuffer:
@@ -68,5 +76,41 @@ class ConversationBuffer:
             used += len(line)
         return "\n".join(reversed(lines))
 
-    def to_dict(self) -> Dict:
-        return {"max_turns": self.max_turns, "turns": [t.to_dict() for t in self.turns]}
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "max_turns": self.max_turns,
+            "max_render_chars": self.max_render_chars,
+            "turns": [t.to_dict() for t in self.turns],
+        }
+
+    def load_from_dict(self, data: Mapping[str, Any]) -> None:
+        """原地恢复持久化的会话缓冲（保持外部持有的引用不断裂）。"""
+        if not isinstance(data, Mapping):
+            return
+        if "max_turns" in data:
+            try:
+                self.max_turns = max(1, int(data["max_turns"]))
+            except (TypeError, ValueError):
+                pass
+        if "max_render_chars" in data:
+            try:
+                self.max_render_chars = max(100, int(data["max_render_chars"]))
+            except (TypeError, ValueError):
+                pass
+        raw_turns = data.get("turns") or []
+        if isinstance(raw_turns, list):
+            restored = [
+                ConversationTurn.from_dict(item)
+                for item in raw_turns
+                if isinstance(item, Mapping) and item.get("content")
+            ]
+            self.turns = restored[-self.max_turns :]
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ConversationBuffer":
+        buf = cls(
+            max_turns=int(data.get("max_turns", 16)) if isinstance(data, Mapping) else 16,
+            max_render_chars=int(data.get("max_render_chars", 2000)) if isinstance(data, Mapping) else 2000,
+        )
+        buf.load_from_dict(data)
+        return buf

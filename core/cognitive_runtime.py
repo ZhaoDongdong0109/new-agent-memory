@@ -152,6 +152,18 @@ class CognitiveRuntime:
         if hasattr(self.agent.memory, "observe_world"):
             self.agent.memory.observe_world(original)
 
+        # 大脑主循环 v2：runtime 多步路径同样接入会话工作记忆与自动编码。
+        # 先捕获不含本轮的历史快照喂给各步提示与 finalizer，再把本轮用户输入入缓冲。
+        is_user_turn = original.source == "user"
+        conv_buf = getattr(self.agent, "conversation", None)
+        prior_conv_text = ""
+        prior_conv_messages: List[Dict[str, str]] = []
+        if is_user_turn and conv_buf is not None:
+            if conv_buf.turns:
+                prior_conv_text = conv_buf.render_context()
+                prior_conv_messages = conv_buf.to_messages()
+            conv_buf.add("user", original.content)
+
         goal_obj, goal = self._ensure_goal(original)
         steps: List[CognitiveStep] = []
         completed = False
@@ -161,7 +173,14 @@ class CognitiveRuntime:
 
         try:
             for index in range(1, max(1, self.config.max_steps) + 1):
-                step_observation = self._build_step_observation(original, goal, steps, index)
+                step_observation = self._build_step_observation(
+                    original,
+                    goal,
+                    steps,
+                    index,
+                    conversation_text=prior_conv_text,
+                    conversation_messages=prior_conv_messages,
+                )
                 workspace = self.agent.build_workspace(step_observation)
                 action = self.agent.select_action(step_observation, workspace)
                 action = self._guard_runtime_action(original, steps, action, index)
@@ -172,6 +191,9 @@ class CognitiveRuntime:
                     synthesize=False,
                     consolidate=False,
                 )
+                # 会话历史只服务于本步规划提示，弹出避免随 episode 重复落盘膨胀
+                step_observation.metadata.pop("conversation", None)
+                step_observation.metadata.pop("conversation_messages", None)
                 step = self._step_from_episode(index, step_observation, workspace.to_prompt_context(), episode)
                 steps.append(step)
 
@@ -183,7 +205,22 @@ class CognitiveRuntime:
                     stop_reason = "failure"
                     break
 
-            result = self._final_result(original, goal, steps, completed, stop_reason)
+            if prior_conv_text:
+                original.metadata["conversation"] = prior_conv_text
+            try:
+                result = self._final_result(original, goal, steps, completed, stop_reason)
+            finally:
+                original.metadata.pop("conversation", None)
+
+            if is_user_turn:
+                reply = result.output if result is not None else ""
+                if reply and conv_buf is not None:
+                    conv_buf.add("assistant", reply)
+                if hasattr(self.agent, "_archive_conversation_overflow"):
+                    self.agent._archive_conversation_overflow()
+                if getattr(self.agent, "auto_extract", False) and hasattr(self.agent, "_auto_encode"):
+                    self.agent._auto_encode(original)
+
             run = CognitiveRun(
                 original_observation=original,
                 goal=goal,
@@ -225,6 +262,21 @@ class CognitiveRuntime:
             "finish",
             "End the CognitiveRuntime run only when the task is satisfied; put the final answer in message.",
             finish,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Complete final user-facing answer.",
+                    },
+                    "next_questions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional follow-up questions.",
+                    },
+                },
+                "required": ["message"],
+            },
         )
 
     def _ensure_goal(self, observation: Observation):
@@ -268,6 +320,8 @@ class CognitiveRuntime:
         goal: str,
         steps: List[CognitiveStep],
         index: int,
+        conversation_text: str = "",
+        conversation_messages: Optional[List[Dict[str, str]]] = None,
     ) -> Observation:
         trace = self._trace_text(steps)
         pending_note = ""
@@ -300,15 +354,20 @@ Runtime rules:
 """.strip()
         if len(content) > self.config.max_trace_chars:
             content = content[: self.config.max_trace_chars] + "\n...[runtime context truncated]"
+        meta: Dict[str, Any] = {
+            "runtime": True,
+            "original_task": original.content,
+            "step_index": index,
+            "goal": goal,
+        }
+        if conversation_text:
+            meta["conversation"] = conversation_text
+        if conversation_messages:
+            meta["conversation_messages"] = list(conversation_messages)
         return self.agent.observe(
             content,
             source="runtime",
-            metadata={
-                "runtime": True,
-                "original_task": original.content,
-                "step_index": index,
-                "goal": goal,
-            },
+            metadata=meta,
         )
 
     def _trace_text(self, steps: List[CognitiveStep]) -> str:
@@ -544,10 +603,12 @@ class LLMRuntimeFinalizer:
                     "reward": step.reward,
                 }
             )
+        conversation = str((run.original_observation.metadata or {}).get("conversation", "") or "")
+        conv_block = f"\nRecent conversation (older first):\n{conversation}\n" if conversation else ""
         prompt = f"""
 Original user task:
 {run.original_observation.content}
-
+{conv_block}
 Runtime goal:
 {run.goal}
 

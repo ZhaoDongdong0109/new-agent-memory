@@ -143,6 +143,10 @@ class HumanLikeMemorySystem:
         self.attention = AttentionOS()
         self.cognitive_state = CognitiveState()
 
+        # 会话工作记忆（支持 save/load 跨进程恢复最近多轮对话）
+        from core.conversation import ConversationBuffer
+        self.conversation = ConversationBuffer()
+
         # 安全与治理层
         self.enable_pii_detection = enable_pii_detection
         self.enable_audit_log = enable_audit_log
@@ -979,6 +983,7 @@ class HumanLikeMemorySystem:
         auto_consolidate: bool = True,
         env_file: Optional[str] = ".env",
         synthesize_tool_responses: bool = True,
+        on_token: Optional[Any] = None,
         **api_overrides: Any,
     ) -> CognitiveAgent:
         """Create an agent backed by an OpenAI-compatible ChatCompletions API."""
@@ -987,6 +992,7 @@ class HumanLikeMemorySystem:
         agent = self.create_agent(name=name, auto_consolidate=auto_consolidate)
         planner = LLMPlanner.from_openai_compatible_env(
             env_file=env_file,
+            on_token=on_token,
             **api_overrides,
         )
         agent.planner = planner
@@ -1012,6 +1018,7 @@ class HumanLikeMemorySystem:
         auto_consolidate: bool = True,
         env_file: Optional[str] = ".env",
         max_steps: int = 4,
+        on_token: Optional[Any] = None,
         **api_overrides: Any,
     ):
         """Create a multi-step CognitiveRuntime backed by an OpenAI-compatible API."""
@@ -1021,6 +1028,7 @@ class HumanLikeMemorySystem:
             name=name,
             auto_consolidate=auto_consolidate,
             env_file=env_file,
+            on_token=on_token,
             **api_overrides,
         )
         llm = getattr(agent.planner, "llm", None)
@@ -1122,6 +1130,10 @@ class HumanLikeMemorySystem:
         cognitive_path = f"{self.data_dir}/cognitive_state.json"
         with open(cognitive_path, 'w', encoding='utf-8') as f:
             json.dump(self.cognitive_state.to_dict(), f, ensure_ascii=False, indent=2)
+
+        conversation_path = f"{self.data_dir}/conversation.json"
+        with open(conversation_path, 'w', encoding='utf-8') as f:
+            json.dump(self.conversation.to_dict(), f, ensure_ascii=False, indent=2)
     
     def load(self) -> bool:
         """加载数据"""
@@ -1166,8 +1178,26 @@ class HumanLikeMemorySystem:
                 cognitive_loaded = True
             except Exception:
                 pass
+
+        conversation_path = f"{self.data_dir}/conversation.json"
+        conversation_loaded = False
+        if os.path.exists(conversation_path):
+            try:
+                with open(conversation_path, 'r', encoding='utf-8') as f:
+                    conversation_data = json.load(f)
+                self.conversation.load_from_dict(conversation_data)
+                conversation_loaded = True
+            except Exception:
+                pass
         
-        return core_loaded or forgotten_loaded or persona_loaded or attention_loaded or cognitive_loaded
+        return (
+            core_loaded
+            or forgotten_loaded
+            or persona_loaded
+            or attention_loaded
+            or cognitive_loaded
+            or conversation_loaded
+        )
     
     # ============ 统计 ============
     

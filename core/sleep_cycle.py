@@ -54,6 +54,13 @@ GIST_SENTENCES = 3
 GIST_REINFORCE_JACCARD = 0.5
 
 
+# 通用元标签（回合固化/显式保存注入的来源类标签）不作为语义聚类锚点，
+# 否则所有 Agent 回合都会因共享 "experience"/"agent" 被并入同一个退化巨簇。
+_GENERIC_META_TOPICS = frozenset(
+    {"experience", "agent", "explicit", "经验", "conversation_archive"}
+)
+
+
 @dataclass
 class SleepReport:
     """一次睡眠周期的完整审计记录"""
@@ -112,7 +119,7 @@ class SleepCycle:
 
     @staticmethod
     def _anchors(chunk: MemoryChunk) -> Set[str]:
-        return set(chunk.persons) | set(chunk.topics)
+        return set(chunk.persons) | (set(chunk.topics) - _GENERIC_META_TOPICS)
 
     def _related(self, a: MemoryChunk, b: MemoryChunk) -> bool:
         anchors_a, anchors_b = self._anchors(a), self._anchors(b)

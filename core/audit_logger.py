@@ -15,6 +15,28 @@ import time
 from typing import Dict, List, Optional
 
 
+class _ClosingFileHandler(logging.FileHandler):
+    """每次写入后立即刷盘并释放文件句柄，避免 Windows 下临时目录清理报 WinError 32。"""
+
+    def __init__(self, filename: str, encoding: str = "utf-8"):
+        super().__init__(filename, mode="a", encoding=encoding, delay=True)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            super().emit(record)
+        finally:
+            self.acquire()
+            try:
+                if self.stream is not None:
+                    try:
+                        self.stream.flush()
+                    finally:
+                        self.stream.close()
+                        self.stream = None
+            finally:
+                self.release()
+
+
 class AuditLogger:
     """
     安全审计日志
@@ -212,9 +234,9 @@ class AuditLogger:
                     os.path.abspath(getattr(existing, "baseFilename", "")) == target:
                 return logger
 
-        # 文件 handler
+        # 文件 handler（写完即释放句柄，兼容 Windows 文件锁语义）
         os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
-        handler = logging.FileHandler(target, encoding="utf-8")
+        handler = _ClosingFileHandler(target, encoding="utf-8")
 
         if self.json_format:
             # JSON 格式不需要 formatter
@@ -228,6 +250,20 @@ class AuditLogger:
         logger.addHandler(handler)
 
         return logger
+
+    def close(self) -> None:
+        """显式关闭并移除当前 logger 持有的全部文件处理器。"""
+        for handler in list(self.logger.handlers):
+            try:
+                handler.close()
+            finally:
+                self.logger.removeHandler(handler)
+
+    def __enter__(self) -> "AuditLogger":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def get_recent_events(
         self,

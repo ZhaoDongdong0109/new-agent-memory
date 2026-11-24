@@ -14,7 +14,7 @@ MCP Server 回归测试
 
 import json
 import os
-import select
+import queue
 import subprocess
 import sys
 import threading
@@ -39,28 +39,38 @@ UNREACHABLE_LLM = "http://127.0.0.1:9/v1"
 
 
 class LineReader:
-    """基于 fd + select 的行读取器，带超时，避免缓冲导致的阻塞/漏读"""
+    """跨平台带超时行读取器（后台线程 + Queue，兼容 Windows 管道与 Linux）。"""
 
     def __init__(self, fileobj):
-        self.fd = fileobj.fileno()
-        self.buf = b""
+        self._fileobj = fileobj
+        self._queue: "queue.Queue[object]" = queue.Queue()
+        self._eof = False
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+
+    def _pump(self):
+        try:
+            while True:
+                raw = self._fileobj.readline()
+                if not raw:
+                    self._queue.put(None)
+                    return
+                self._queue.put(raw.rstrip(b"\r\n").decode("utf-8", errors="replace"))
+        except Exception:
+            self._queue.put(None)
 
     def read_line(self, timeout):
         """读取一行（不含换行符）；超时或 EOF 返回 None"""
-        deadline = time.time() + timeout
-        while b"\n" not in self.buf:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                return None
-            ready, _, _ = select.select([self.fd], [], [], remaining)
-            if not ready:
-                return None
-            chunk = os.read(self.fd, 65536)
-            if not chunk:
-                return None
-            self.buf += chunk
-        line, self.buf = self.buf.split(b"\n", 1)
-        return line.decode("utf-8")
+        if self._eof:
+            return None
+        try:
+            item = self._queue.get(timeout=max(0.0, float(timeout)))
+        except queue.Empty:
+            return None
+        if item is None:
+            self._eof = True
+            return None
+        return item
 
 
 @pytest.fixture
